@@ -1,0 +1,10 @@
+{
+  "name": "github-runner-orchestrator-worker",
+  "private": true,
+  "description": "Mints GitHub JIT runner credentials and launches the MicroVM. Must be packaged WITH node_modules: @aws-sdk/client-lambda-microvms is not part of the standard Lambda Node.js runtime.",
+  "main": "index.js",
+  "dependencies": {
+    "@aws-sdk/client-lambda-microvms": "^3.1116.0",
+    "@aws-sdk/client-ssm": "^3.1116.0"
+  }
+}

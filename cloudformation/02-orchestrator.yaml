@@ -1,0 +1,419 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  GitHub Ephemeral Runner Orchestrator - Phase B (orchestrator).
+  Deploy this AFTER cloudformation/01-foundation.yaml has been deployed and
+  BOTH MicroVM runner images (docker + no-docker flavors) have been built by
+  scripts/03-build-microvm-images.sh, and the two Lambda deployment packages
+  have been uploaded by scripts/02-package-lambdas.sh.
+  Creates: SQS work queue + DLQ, the MicroVM execution role, the Orchestrator
+  Lambda (webhook receiver), the Worker Lambda (JIT token mint + MicroVM
+  launch), and an HTTP API Gateway endpoint for GitHub to call.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: github-runner-orchestrator
+    Description: Must match the ProjectName used for 01-foundation.yaml.
+
+  CodeBucketName:
+    Type: String
+    Description: >
+      S3 bucket name from the 01-foundation.yaml stack's CodeBucketName
+      output (e.g. via `aws cloudformation describe-stacks`).
+
+  OrchestratorCodeKey:
+    Type: String
+    Default: lambda/orchestrator.zip
+    Description: S3 key of the orchestrator Lambda zip inside CodeBucketName.
+
+  WorkerCodeKey:
+    Type: String
+    Default: lambda/worker.zip
+    Description: S3 key of the worker Lambda zip inside CodeBucketName.
+
+  MicrovmImageArnDocker:
+    Type: String
+    AllowedPattern: '^arn:aws[a-zA-Z-]*:lambda:[a-z0-9-]+:\d{12}:microvm-image:.+$'
+    Description: >
+      ARN of the built 'github-runner-docker' MicroVM image (Docker-in-Docker
+      flavor), from scripts/03-build-microvm-images.sh output.
+
+  MicrovmImageArnNoDocker:
+    Type: String
+    AllowedPattern: '^arn:aws[a-zA-Z-]*:lambda:[a-z0-9-]+:\d{12}:microvm-image:.+$'
+    Description: >
+      ARN of the built 'github-runner-no-docker' MicroVM image (plain
+      flavor), from scripts/03-build-microvm-images.sh output.
+
+  WebhookSecretParamName:
+    Type: String
+    Default: /github-runner-orchestrator/webhook-secret
+    Description: >
+      Name of a pre-existing SSM SecureString parameter holding the shared
+      HMAC secret configured on the GitHub webhook. CloudFormation cannot
+      create SecureString values - create it first with
+      scripts/00-create-ssm-params.sh or `aws ssm put-parameter`.
+
+  AppCredentialsParamName:
+    Type: String
+    Default: /github-runner-orchestrator/app-credentials
+    Description: >
+      Name of a pre-existing SSM SecureString parameter holding the GitHub
+      App credentials JSON ({appClientId, installationId, privateKey}).
+
+  RunnerScope:
+    Type: String
+    AllowedValues: [organization, repository]
+    Default: organization
+    Description: >
+      Where JIT runners register. 'organization' calls
+      /orgs/{org}/actions/runners/generate-jitconfig and requires
+      RunnerGroupId plus a GitHub App installed at the organization level
+      with the 'Self-hosted runners' organization permission. 'repository'
+      calls /repos/{owner}/{repo}/actions/runners/generate-jitconfig and
+      only needs the App's 'Administration' repository permission - no
+      runner group. See README.md for the exact GitHub App setup for each.
+
+  RunnerGroupId:
+    Type: String
+    Default: '1'
+    Description: >
+      GitHub runner group ID new runners are registered into. Only used
+      when RunnerScope=organization; ignored for RunnerScope=repository
+      (repositories have no runner groups).
+
+  RequiredRunnerLabel:
+    Type: String
+    Default: lambda-microvms
+    Description: A queued workflow_job must carry this label to trigger a runner.
+
+  DockerRunnerLabel:
+    Type: String
+    Default: docker
+    Description: >
+      A queued job carrying this label (in addition to RequiredRunnerLabel)
+      launches the Docker-in-Docker image instead of the plain image.
+
+  MicrovmMaxIdleSeconds:
+    Type: Number
+    Default: 1800
+    Description: idlePolicy.maxIdleDurationSeconds passed to RunMicrovm.
+
+  MicrovmSuspendedSeconds:
+    Type: Number
+    Default: 10
+    Description: idlePolicy.suspendedDurationSeconds passed to RunMicrovm.
+
+  MicrovmMaxDurationSeconds:
+    Type: Number
+    Default: 3600
+    Description: >
+      maximumDurationInSeconds passed to RunMicrovm - the hard ceiling on
+      how long a single job's MicroVM may run before the platform force
+      -terminates it (max 28800 = 8 hours).
+
+  OrchestratorLogRetentionDays:
+    Type: Number
+    Default: 14
+  WorkerLogRetentionDays:
+    Type: Number
+    Default: 14
+
+Resources:
+  # ══════════════════════════════════════════════════════════════════════
+  # Queueing
+  # ══════════════════════════════════════════════════════════════════════
+  WebhookDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-webhook-dlq'
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  WebhookQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-webhook-queue'
+      VisibilityTimeout: 90 # >= WorkerFunction Timeout (60s) with headroom
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt WebhookDlq.Arn
+        maxReceiveCount: 3
+
+  # ══════════════════════════════════════════════════════════════════════
+  # MicrovmExecutionRole - assumed by the running MicroVM itself (exposed
+  # inside the guest via IMDSv2, picked up automatically by the AWS SDK's
+  # default credential chain in microvm/app.js). Used only to self
+  # -terminate after the job finishes and to ship stdout to CloudWatch.
+  #
+  # lambda:TerminateMicrovm is scoped to the microvm:* resource (the
+  # RUNNING instance), not the microvm-image:* resource - the reference
+  # CDK repo scoped this to the image ARNs, which does not match AWS's
+  # documented "Operator Policy Example" (TerminateMicrovm acts on a
+  # microvm identifier, never an image identifier).
+  # ══════════════════════════════════════════════════════════════════════
+  MicrovmExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-microvm-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:*'
+      Policies:
+        - PolicyName: self-terminate-and-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SelfTerminate
+                Effect: Allow
+                Action: lambda:TerminateMicrovm
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm:*'
+              - Sid: ShipLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda-microvms/*'
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Orchestrator Lambda - webhook receiver
+  # ══════════════════════════════════════════════════════════════════════
+  OrchestratorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-orchestrator'
+      RetentionInDays: !Ref OrchestratorLogRetentionDays
+
+  OrchestratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-orchestrator-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: orchestrator-permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                # Constructed explicitly (rather than !GetAtt OrchestratorLogGroup.Arn) so the
+                # trailing ':*' needed for PutLogEvents on log streams is guaranteed present.
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-orchestrator:*'
+              - Sid: ReadWebhookSecret
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${WebhookSecretParamName}'
+              - Sid: EnqueueRunnerRequest
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt WebhookQueue.Arn
+
+  OrchestratorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: OrchestratorLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-orchestrator'
+      Description: Verifies the GitHub webhook signature and enqueues matching workflow_job events.
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt OrchestratorRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref OrchestratorCodeKey
+      Environment:
+        Variables:
+          WEBHOOK_SECRET_PARAM: !Ref WebhookSecretParamName
+          REQUIRED_RUNNER_LABEL: !Ref RequiredRunnerLabel
+          QUEUE_URL: !Ref WebhookQueue
+          RUNNER_SCOPE: !Ref RunnerScope
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Worker Lambda - mints JIT credentials and launches the MicroVM
+  # ══════════════════════════════════════════════════════════════════════
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-worker'
+      RetentionInDays: !Ref WorkerLogRetentionDays
+
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-worker-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: worker-permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-worker:*'
+              - Sid: ConsumeQueue
+                Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt WebhookQueue.Arn
+              - Sid: ReadAppCredentials
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AppCredentialsParamName}'
+              - Sid: RunMicrovm
+                Effect: Allow
+                Action: lambda:RunMicrovm
+                Resource:
+                  - !Ref MicrovmImageArnDocker
+                  - !Ref MicrovmImageArnNoDocker
+              - Sid: PassNetworkConnectors
+                Effect: Allow
+                # Required for EVERY RunMicrovm call, even with no explicit
+                # connectors passed - MicroVMs default to AWS-managed
+                # connectors which are themselves "passed" at run time.
+                # See the aws-lambda-microvms skill's iam-and-security.md.
+                Action: lambda:PassNetworkConnector
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:*'
+              - Sid: PassExecutionRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt MicrovmExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: lambda.amazonaws.com
+
+  WorkerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: WorkerLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-worker'
+      Description: Mints a GitHub JIT runner token and launches the ephemeral MicroVM runner.
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt WorkerRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref WorkerCodeKey
+      Environment:
+        Variables:
+          GITHUB_APP_CREDENTIALS_PARAM: !Ref AppCredentialsParamName
+          RUNNER_SCOPE: !Ref RunnerScope
+          RUNNER_GROUP_ID: !Ref RunnerGroupId
+          REQUIRED_RUNNER_LABEL: !Ref RequiredRunnerLabel
+          DOCKER_RUNNER_LABEL: !Ref DockerRunnerLabel
+          MICROVM_IMAGE_IDENTIFIER_DOCKER: !Ref MicrovmImageArnDocker
+          MICROVM_IMAGE_IDENTIFIER_NO_DOCKER: !Ref MicrovmImageArnNoDocker
+          MICROVM_EXECUTION_ROLE_ARN: !GetAtt MicrovmExecutionRole.Arn
+          MICROVM_INGRESS_NETWORK_CONNECTORS: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:NO_INGRESS'
+          MICROVM_EGRESS_NETWORK_CONNECTORS: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:INTERNET_EGRESS'
+          MICROVM_MAX_IDLE_SECONDS: !Ref MicrovmMaxIdleSeconds
+          MICROVM_SUSPENDED_SECONDS: !Ref MicrovmSuspendedSeconds
+          MICROVM_MAX_DURATION_SECONDS: !Ref MicrovmMaxDurationSeconds
+
+  WorkerEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt WebhookQueue.Arn
+      FunctionName: !Ref WorkerFunction
+      BatchSize: 1
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  # ══════════════════════════════════════════════════════════════════════
+  # API Gateway (HTTP API) - GitHub webhook entry point
+  # ══════════════════════════════════════════════════════════════════════
+  WebhookApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-webhook-api'
+      ProtocolType: HTTP
+
+  WebhookIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebhookApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt OrchestratorFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  WebhookRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebhookApi
+      RouteKey: 'POST /webhook'
+      Target: !Sub 'integrations/${WebhookIntegration}'
+
+  WebhookStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebhookApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  WebhookApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref OrchestratorFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${WebhookApi}/*/*/webhook'
+
+Outputs:
+  WebhookUrl:
+    Description: Configure this as the GitHub webhook Payload URL
+    Value: !Sub '${WebhookApi.ApiEndpoint}/webhook'
+
+  WebhookSecretParamName:
+    Value: !Ref WebhookSecretParamName
+
+  AppCredentialsParamName:
+    Value: !Ref AppCredentialsParamName
+
+  QueueUrl:
+    Value: !Ref WebhookQueue
+
+  DlqUrl:
+    Value: !Ref WebhookDlq
+
+  OrchestratorFunctionArn:
+    Value: !GetAtt OrchestratorFunction.Arn
+
+  WorkerFunctionArn:
+    Value: !GetAtt WorkerFunction.Arn
+
+  MicrovmExecutionRoleArn:
+    Value: !GetAtt MicrovmExecutionRole.Arn
+
+  RunnerScope:
+    Value: !Ref RunnerScope

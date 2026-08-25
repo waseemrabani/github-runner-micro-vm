@@ -1,0 +1,116 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  GitHub Ephemeral Runner Orchestrator - Phase A (foundation).
+  Creates the S3 bucket that holds the MicroVM image code artifact and the
+  Lambda deployment packages, plus the IAM role Lambda MicroVMs assumes while
+  building a MicroVM image.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: github-runner
+    Description: >
+      Prefix used for resource names and the default SSM parameter paths.
+      Must be unique enough to avoid S3 bucket name collisions (a random
+      suffix is appended automatically).
+
+Resources:
+  # ──────────────────────────────────────────────────────────────────────
+  # S3 bucket for the MicroVM image zip (Dockerfile + app.js + entrypoint.sh)
+  # and the two Lambda function deployment packages (orchestrator.zip,
+  # worker.zip). Retained on stack deletion on purpose: deleting this stack
+  # should never silently destroy build artifacts.
+  # ──────────────────────────────────────────────────────────────────────
+  CodeBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ProjectName}-code-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  # ──────────────────────────────────────────────────────────────────────
+  # MicrovmBuildRole - assumed by the Lambda MicroVMs build service while
+  # compiling the Dockerfile in the uploaded code artifact into an image
+  # snapshot (CreateMicrovmImage / UpdateMicrovmImage).
+  #
+  # Trust policy follows AWS's documented confused-deputy guidance
+  # (see the "aws-lambda-microvms" skill's iam-and-security.md): scope the
+  # AssumeRole to this account and to microvm-image resources only.
+  #
+  # NOTE: the reference CDK repo (donkersgoed/github-runner-ochestrator)
+  # left this trust policy as a bare `lambda.amazonaws.com` principal with
+  # a `// TODO VERIFY AT DEPLOY` comment. The conditions below are the
+  # documented fix.
+  # ──────────────────────────────────────────────────────────────────────
+  MicrovmBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-microvm-build-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:*'
+      Policies:
+        - PolicyName: read-code-artifact
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadCodeArtifact
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub '${CodeBucket.Arn}/microvm/*'
+              - Sid: WriteBuildLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda-microvms/*'
+
+Outputs:
+  CodeBucketName:
+    Description: S3 bucket holding the MicroVM code artifact and Lambda zips
+    Value: !Ref CodeBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeBucketName'
+
+  MicrovmBuildRoleArn:
+    Description: IAM role ARN assumed by Lambda MicroVMs during image builds
+    Value: !GetAtt MicrovmBuildRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-MicrovmBuildRoleArn'
+
+  MicrovmBaseImageArn:
+    Description: >
+      AWS-managed MicroVM base image (Amazon Linux 2023). Derived from the
+      stack's own region/partition - no lookup needed. Pass this as
+      --base-image-arn when building the runner images.
+    Value: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:aws:microvm-image:al2023-1'
+    Export:
+      Name: !Sub '${AWS::StackName}-MicrovmBaseImageArn'
+
+  Region:
+    Description: Region this stack is deployed in
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub '${AWS::StackName}-Region'

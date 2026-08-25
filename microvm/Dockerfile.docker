@@ -1,0 +1,119 @@
+# Docker-in-Docker ephemeral GitHub Actions runner image. Everything here is
+# identical to Dockerfile.base plus the Docker engine + dnsmasq, selected by
+# a job carrying the DockerRunnerLabel (default: "docker"). See
+# Dockerfile.base's header comment for why the container base is Ubuntu
+# rather than AWS's al2023-minimal image.
+FROM ubuntu:24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      ca-certificates curl gnupg tar gzip net-tools git jq dnsmasq unzip && \
+    rm -rf /var/lib/apt/lists/*
+
+# Node.js 22 (NodeSource - Ubuntu's own repos only ship Node 18)
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Docker engine (daemon + CLI + buildx) for jobs that build/run containers,
+# e.g. `docker build`, docker-compose based test suites, or CDK constructs
+# that bundle assets via Docker. Started by app.js at boot (see
+# microvm/app.js) rather than in entrypoint.sh - there is no init system in
+# the microVM to supervise it otherwise.
+RUN install -m 0755 -d /etc/apt/keyrings && \
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc && \
+    chmod a+r /etc/apt/keyrings/docker.asc && \
+    echo "deb [arch=arm64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable" \
+      > /etc/apt/sources.list.d/docker.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+      docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin iptables && \
+    rm -rf /var/lib/apt/lists/*
+# Signals app.js to start dockerd+dnsmasq at boot and gate /ready on docker
+# readiness. Not set in Dockerfile.base, where dockerState initializes
+# straight to 'ready'.
+ENV RUNNER_HAS_DOCKER=1
+
+# AWS CLI v2 - workflow steps commonly invoke `aws`, and it is not present in
+# the base Ubuntu image. ARM64 build; swap for the x86_64 installer below if
+# your account's Lambda MicroVMs builds target that architecture instead.
+RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o /tmp/awscliv2.zip && \
+    unzip -q /tmp/awscliv2.zip -d /tmp && \
+    /tmp/aws/install && \
+    rm -rf /tmp/awscliv2.zip /tmp/aws
+
+# Bump via `docker build --build-arg RUNNER_VERSION=x.y.z` or by editing this
+# default. Check https://github.com/actions/runner/releases for the latest.
+ARG RUNNER_VERSION=2.335.1
+# GitHub's release asset naming: "arm64" or "x64" (not "x86_64"). If you
+# change this to x64, also change the docker.list arch= above and the
+# awscli/python ARCH args below.
+ARG RUNNER_ARCH=arm64
+WORKDIR /actions-runner
+
+RUN curl -fsSL -O "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz" && \
+    tar xzf "actions-runner-linux-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz" && \
+    rm "actions-runner-linux-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz" && \
+    ./bin/installdependencies.sh && \
+    rm -rf /var/lib/apt/lists/*
+
+# Pre-populate the actions/setup-python tool cache with CPython so jobs skip
+# the download. AGENT_TOOLSDIRECTORY is honored both by python-versions'
+# setup.sh at build time (below) and by the runner at job time, where it is
+# exposed to jobs as RUNNER_TOOL_CACHE.
+ENV AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
+ARG PYTHON_VERSION=3.13.14
+ARG PYTHON_PLATFORM_VERSION=24.04
+ARG PYTHON_ARCH=arm64
+
+# Shared-library runtime deps for the prebuilt CPython stdlib (ssl/ffi/zlib
+# /uuid already ship in the base image; these cover sqlite3, bz2, lzma,
+# readline, curses and gdbm).
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      libsqlite3-0 libbz2-1.0 liblzma5 libreadline8t64 libncursesw6 libgdbm6t64 libgdbm-compat4t64 && \
+    rm -rf /var/lib/apt/lists/*
+
+# Resolve the download URL from the python-versions manifest (avoids
+# hardcoding a release id), extract, and run the bundled setup.sh, which
+# installs into $AGENT_TOOLSDIRECTORY, creates the python symlinks, upgrades
+# pip, and writes the completion marker actions/setup-python checks for.
+RUN set -eux; \
+    url="$(curl -fsSL https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json \
+      | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const m=JSON.parse(d);const[v,pv,a]=process.argv.slice(1);const e=m.find(x=>x.version===v);if(!e){console.error("version "+v+" not in manifest");process.exit(1)}const f=e.files.find(f=>f.platform==="linux"&&f.platform_version===pv&&f.arch===a);if(!f){console.error("no matching linux build for "+v+" "+pv+" "+a);process.exit(1)}process.stdout.write(f.download_url)})' "$PYTHON_VERSION" "$PYTHON_PLATFORM_VERSION" "$PYTHON_ARCH")"; \
+    echo "Downloading $url"; \
+    mkdir -p /tmp/py; \
+    curl -fsSL "$url" -o /tmp/py/python.tar.gz; \
+    tar xzf /tmp/py/python.tar.gz -C /tmp/py; \
+    ( cd /tmp/py && bash ./setup.sh ); \
+    rm -rf /tmp/py
+
+# setup.sh only installs into the tool cache; its bin/ only reaches PATH when
+# a workflow runs actions/setup-python. Symlink python/pip into
+# /usr/local/bin and put its bin/ on the global PATH so they work for every
+# job without requiring that action (fixes "pip: command not found").
+RUN set -eux; \
+    py_bin="${AGENT_TOOLSDIRECTORY}/Python/${PYTHON_VERSION}/${PYTHON_ARCH}/bin"; \
+    ln -sf "${py_bin}/python3" /usr/local/bin/python3; \
+    ln -sf "${py_bin}/python3" /usr/local/bin/python; \
+    ln -sf "${py_bin}/pip3" /usr/local/bin/pip3; \
+    ln -sf "${py_bin}/pip3" /usr/local/bin/pip
+ENV PATH="${AGENT_TOOLSDIRECTORY}/Python/${PYTHON_VERSION}/${PYTHON_ARCH}/bin:${PATH}"
+
+COPY entrypoint.sh .
+RUN chmod +x entrypoint.sh
+
+# Install SDK dependencies before copying app.js so this layer caches
+# independently of application code changes.
+COPY package.json .
+RUN npm install --omit=dev --no-audit --no-fund
+
+COPY app.js .
+
+# The runner refuses to start as root by default; containers run as root here.
+ENV RUNNER_ALLOW_RUNASROOT=1
+
+EXPOSE 8080 9000
+CMD ["node", "app.js"]

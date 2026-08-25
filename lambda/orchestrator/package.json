@@ -1,0 +1,6 @@
+{
+  "name": "github-runner-orchestrator-webhook",
+  "private": true,
+  "description": "GitHub webhook receiver Lambda. Deployed as a plain zip - no node_modules required: the Node.js 22.x managed Lambda runtime already bundles @aws-sdk/client-ssm and @aws-sdk/client-sqs.",
+  "main": "index.js"
+}
