@@ -7,10 +7,11 @@
 # outputs).
 #
 # Override any of these via the environment before running:
-#   RUNNER_SCOPE=organization|repository   (default: organization)
-#   RUNNER_GROUP_ID=1                      (organization scope only)
-#   REQUIRED_RUNNER_LABEL=lambda-microvms
-#   DOCKER_RUNNER_LABEL=docker
+  RUNNER_SCOPE=repository   ##(default: organization)
+  #RUNNER_GROUP_ID=1                      #(organization scope only)
+  REQUIRED_RUNNER_LABEL=lambda-microvms
+  DOCKER_RUNNER_LABEL=docker
+  MICROVM_IMAGE_ARN_NO_DOCKER=arn:aws:lambda:ap-southeast-1:590184095829:microvm-image:github-runner-docker
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./lib.sh

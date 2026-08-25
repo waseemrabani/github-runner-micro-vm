@@ -67,20 +67,26 @@ Parameters:
     Default: organization
     Description: >
       Where JIT runners register. 'organization' calls
-      /orgs/{org}/actions/runners/generate-jitconfig and requires
-      RunnerGroupId plus a GitHub App installed at the organization level
-      with the 'Self-hosted runners' organization permission. 'repository'
-      calls /repos/{owner}/{repo}/actions/runners/generate-jitconfig and
-      only needs the App's 'Administration' repository permission - no
-      runner group. See README.md for the exact GitHub App setup for each.
+      /orgs/{org}/actions/runners/generate-jitconfig and requires a GitHub
+      App installed at the organization level with the 'Self-hosted
+      runners' organization permission. 'repository' calls
+      /repos/{owner}/{repo}/actions/runners/generate-jitconfig and only
+      needs the App's 'Administration' repository permission. RunnerGroupId
+      is required by GitHub's API on BOTH endpoints - repos have no
+      user-visible runner-group UI, but the API still requires the field;
+      every repo (including personal-account repos) has an implicit
+      default group, id 1. See README.md for the exact GitHub App setup
+      for each.
 
   RunnerGroupId:
     Type: String
     Default: '1'
     Description: >
-      GitHub runner group ID new runners are registered into. Only used
-      when RunnerScope=organization; ignored for RunnerScope=repository
-      (repositories have no runner groups).
+      GitHub runner group ID new runners are registered into. Required by
+      GitHub's API for BOTH RunnerScope values, even though repositories
+      have no runner-group UI to look this up in - use the default (1)
+      unless you know you need a different group (organization scope
+      only; repos only ever have the implicit default group).
 
   RequiredRunnerLabel:
     Type: String
@@ -161,11 +167,17 @@ Resources:
             Principal:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
+            # No ArnLike/aws:SourceArn condition here: we already found the
+            # documented iam:PassedToService value for this preview service
+            # doesn't match what it actually presents (see PassExecutionRole
+            # below), so an unverifiable SourceArn pattern on THIS trust
+            # policy is a plausible reason a MicroVM's own IMDSv2 credential
+            # vending (used by app.js's self-terminate call) could silently
+            # fail. aws:SourceAccount alone still blocks the confused-deputy
+            # case (another account's microvm-image can't assume this role).
             Condition:
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
-              ArnLike:
-                aws:SourceArn: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:*'
       Policies:
         - PolicyName: self-terminate-and-logs
           PolicyDocument:
@@ -174,7 +186,24 @@ Resources:
               - Sid: SelfTerminate
                 Effect: Allow
                 Action: lambda:TerminateMicrovm
-                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm:*'
+                # Confirmed live (2026-08-25, ap-southeast-1): when the
+                # MicroVM calls TerminateMicrovm on ITSELF from inside the
+                # guest via its IMDSv2-vended session
+                # (assumed-role/.../Lambda-microvmsExecutor-<session>), the
+                # platform authorizes it against the microvm-IMAGE arn, not
+                # a microvm:* instance arn - the opposite of AWS's
+                # documented "operator policy" example, which is written
+                # for an EXTERNAL caller passing an explicit
+                # microvmIdentifier (e.g. our Worker Lambda calling
+                # RunMicrovm/TerminateMicrovm from outside). Grant both
+                # shapes since we've now seen conflicting behavior between
+                # documented and observed: the reference CDK repo's
+                # original image-ARN scoping was right for this exact
+                # self-call path.
+                Resource:
+                  - !Ref MicrovmImageArnDocker
+                  - !Ref MicrovmImageArnNoDocker
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm:*'
               - Sid: ShipLogs
                 Effect: Allow
                 Action:
@@ -306,10 +335,15 @@ Resources:
               - Sid: PassExecutionRole
                 Effect: Allow
                 Action: iam:PassRole
+                # No iam:PassedToService condition here: AWS does not document
+                # the service-principal string RunMicrovm presents for this
+                # check, and in practice it does NOT match plain
+                # 'lambda.amazonaws.com' (confirmed live - that condition
+                # caused RunMicrovm to fail with AccessDeniedException on
+                # PassRole even though the role's own trust policy uses that
+                # principal). Least privilege here comes from Resource being
+                # scoped to this one specific role ARN, not the condition.
                 Resource: !GetAtt MicrovmExecutionRole.Arn
-                Condition:
-                  StringEquals:
-                    iam:PassedToService: lambda.amazonaws.com
 
   WorkerFunction:
     Type: AWS::Lambda::Function

@@ -110,7 +110,7 @@ Set `RunnerScope` to match how you installed the app:
 - Install the App on just the target repository/repositories.
 - **Repository permissions → Administration: Read and write**.
 - Webhook is configured on that repository (**Repo Settings → Webhooks**).
-- No runner group — repositories don't have one. `RunnerGroupId` is ignored.
+- **`RunnerGroupId` is still required** — confirmed against the live GitHub API: omitting it returns `422 missing required key: runner_group_id`, even though repositories (including personal-account ones with no organization at all) have no runner-group UI to look this up in. Leave it at the default `1`, which is the implicit default group every repo has.
 - Calls `POST /repos/{owner}/{repo}/actions/runners/generate-jitconfig`.
 
 Either way, after installing the App, collect:
@@ -152,7 +152,7 @@ All of these are CloudFormation parameters on `02-orchestrator.yaml` (see the te
 | Parameter | Default | Notes |
 |---|---|---|
 | `RunnerScope` | `organization` | `organization` \| `repository` |
-| `RunnerGroupId` | `1` | Organization scope only |
+| `RunnerGroupId` | `1` | Required by GitHub's API for both scopes; leave at `1` for repository scope |
 | `RequiredRunnerLabel` | `lambda-microvms` | Must be present for the orchestrator to act at all |
 | `DockerRunnerLabel` | `docker` | Routes to the Docker-in-Docker image |
 | `MicrovmMaxIdleSeconds` | `1800` | `idlePolicy.maxIdleDurationSeconds` — moot here since the runner self-terminates on job exit, kept as a safety net |
@@ -173,10 +173,12 @@ Per the reference author's numbers: MicroVMs are billed at roughly **$0.0044/min
 
 ## Differences from the reference implementation
 
-Cross-checking the CDK reference repo against [AWS's own IAM/security docs](https://github.com/aws/agent-toolkit-for-aws/blob/main/skills/specialized-skills/serverless-skills/aws-lambda-microvms/references/iam-and-security.md) surfaced two corrections carried into this project:
+Cross-checking the CDK reference repo against AWS's own docs, and against what actually happens when deployed, surfaced a few IAM points worth calling out:
 
-1. **`lambda:TerminateMicrovm` is scoped to the running `microvm:*` resource, not the `microvm-image:*` ARNs.** AWS's documented "operator policy" example scopes `TerminateMicrovm`/`SuspendMicrovm`/etc. to `arn:...:microvm:*` — a MicroVM *instance*, not the image it was built from. The reference repo's `MicrovmExecutionRole` scoped it to the two image ARNs instead.
-2. **Trust policies use `aws:SourceAccount`/`aws:SourceArn` conditions.** The reference repo's build and execution role trust policies were a bare `Principal: lambda.amazonaws.com` with a code comment flagging it as unverified; AWS's docs give the exact condition block to use to prevent the confused-deputy problem, which both roles here now include.
+1. **`lambda:TerminateMicrovm` needs to be granted against BOTH `microvm-image:*` and `microvm:*` ARNs, depending on who's calling.** AWS's documented "operator policy" example (in the `aws-lambda-microvms` skill's `iam-and-security.md`) scopes `TerminateMicrovm` to `arn:...:microvm:*` — a running instance, not the image it was built from — which reads as more correct than the reference repo's choice of scoping it to the two image ARNs instead. In practice, confirmed against a live deployment, that documented example is for an *external* caller (like this project's Worker Lambda calling `RunMicrovm`) — but when a MicroVM terminates *itself* from inside the guest via its IMDSv2-vended session, the platform authorizes that specific call against the **image** ARN instead, and denies it against `microvm:*`. So the reference repo's original scoping was actually right for the self-terminate path; this project grants both shapes on `MicrovmExecutionRole` to cover both call sites correctly.
+2. **Trust policies use an `aws:SourceAccount` condition.** The reference repo's build and execution role trust policies were a bare `Principal: lambda.amazonaws.com` with a code comment flagging it as unverified. An earlier version of this project also added an `aws:SourceArn` condition scoped to `microvm-image:*` per AWS's docs, on both roles — but that turned out to silently break the execution role's own IMDSv2 credential vending in practice (the same "documented example doesn't match observed behavior" pattern as point 1), so it's been dropped, leaving just `aws:SourceAccount` for confused-deputy protection.
+
+The lesson from both of these: for this particular service, AWS's own published IAM examples don't reliably match what's enforced at runtime — verify against a real deployment's CloudWatch logs rather than trusting the docs alone if something doesn't behave as expected.
 
 Everything else — the webhook HMAC verification, `workflow_job` filtering, JIT token minting via a GitHub App JWT → installation token → `generate-jitconfig`, the gzip-compressed run-hook payload, and the `/ready` `/run` `/terminate` lifecycle hooks in `microvm/app.js` — follows the reference implementation's design, translated from CDK/TypeScript into plain CloudFormation YAML and Node.js.
 

@@ -92,7 +92,7 @@ exports.handler = async (event) => {
     const jit =
       scope === 'organization'
         ? await generateOrgJitConfig(token, owner, { name: runnerName, runnerGroupId: RUNNER_GROUP_ID, labels })
-        : await generateRepoJitConfig(token, owner, repo, { name: runnerName, labels });
+        : await generateRepoJitConfig(token, owner, repo, { name: runnerName, runnerGroupId: RUNNER_GROUP_ID, labels });
     console.log(`[${runId}] generateJitConfig (${scope}): ${Date.now() - t}ms - JIT runner created:`, JSON.stringify(jit.runner));
 
     stage = 'runMicrovmWithRetry';

@@ -3,12 +3,15 @@ Description: >
   GitHub Ephemeral Runner Orchestrator - Phase A (foundation).
   Creates the S3 bucket that holds the MicroVM image code artifact and the
   Lambda deployment packages, plus the IAM role Lambda MicroVMs assumes while
-  building a MicroVM image.
+  building a MicroVM image. This stack has no dependency on the MicroVM
+  images and is always deployable on its own. Deploy this first, then run
+  scripts/02-package-lambdas.sh and scripts/03-build-microvm-images.sh, then
+  deploy cloudformation/02-orchestrator.yaml.
 
 Parameters:
   ProjectName:
     Type: String
-    Default: github-runner
+    Default: github-runner-orchestrator
     Description: >
       Prefix used for resource names and the default SSM parameter paths.
       Must be unique enough to avoid S3 bucket name collisions (a random
@@ -64,11 +67,17 @@ Resources:
             Principal:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
+            # No ArnLike/aws:SourceArn condition - see the matching comment
+            # on MicrovmExecutionRole in 02-orchestrator.yaml. Image builds
+            # have worked fine with this condition present (it doesn't block
+            # CreateMicrovmImage the way the analogous condition blocked
+            # execution-role credential vending), but dropped for consistency
+            # now that we know this service's SourceArn shape isn't
+            # documented or verified. aws:SourceAccount alone still covers
+            # the confused-deputy case.
             Condition:
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
-              ArnLike:
-                aws:SourceArn: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:*'
       Policies:
         - PolicyName: read-code-artifact
           PolicyDocument:

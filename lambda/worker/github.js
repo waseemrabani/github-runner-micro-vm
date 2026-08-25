@@ -84,7 +84,14 @@ async function generateOrgJitConfig(installationToken, org, params, apiBase = DE
 /**
  * Repo-scoped JIT runner config. Requires the GitHub App to have the
  * "Administration" repository permission (read & write) on the target repo.
- * Repositories have no runner groups, so runner_group_id is never sent.
+ *
+ * NOTE: despite repositories having no user-visible "runner groups" UI,
+ * GitHub's REST API requires runner_group_id on this endpoint too (confirmed
+ * against the live API: omitting it returns 422 "missing required key:
+ * runner_group_id"). Every repo - including personal-account repos with no
+ * organization at all - has an implicit default group, id 1, which is what
+ * `runs-on: [self-hosted, ...]` targets when no group is otherwise
+ * configurable. Pass 1 unless you have a specific reason not to.
  */
 async function generateRepoJitConfig(installationToken, owner, repo, params, apiBase = DEFAULT_API_BASE) {
   const res = await authedPost(
@@ -92,6 +99,7 @@ async function generateRepoJitConfig(installationToken, owner, repo, params, api
     installationToken,
     {
       name: params.name,
+      runner_group_id: params.runnerGroupId,
       labels: params.labels,
       ...(params.workFolder ? { work_folder: params.workFolder } : {}),
     }

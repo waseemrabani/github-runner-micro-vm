@@ -4,9 +4,9 @@
 # Safe to re-run - it overwrites the existing values.
 #
 # Usage:
-#   PRIVATE_KEY_PATH=/path/to/app-private-key.pem \
-#   GITHUB_APP_CLIENT_ID=Iv1.abc123 \
-#   GITHUB_APP_INSTALLATION_ID=12345678 \
+  PRIVATE_KEY_PATH=/Users/waseem/Downloads/runner-app.private-key.pem
+  GITHUB_APP_CLIENT_ID=Iv23liQleZxbGv7SyKpG
+  GITHUB_APP_INSTALLATION_ID=156400071
 #   ./00-create-ssm-params.sh
 #
 # WEBHOOK_SECRET is generated for you (openssl rand -hex 32) if not set in
@@ -34,7 +34,8 @@ aws ssm put-parameter \
   --name "$WEBHOOK_SECRET_PARAM_NAME" \
   --type SecureString \
   --value "$WEBHOOK_SECRET" \
-  --overwrite >/dev/null
+  --overwrite >/dev/null \
+  --region ap-southeast-1
 
 log "Writing GitHub App credentials to SSM parameter: ${APP_CREDENTIALS_PARAM_NAME}"
 CREDS_JSON="$(jq -n \
@@ -47,7 +48,8 @@ aws ssm put-parameter \
   --name "$APP_CREDENTIALS_PARAM_NAME" \
   --type SecureString \
   --value "$CREDS_JSON" \
-  --overwrite >/dev/null
+  --overwrite >/dev/null \
+  --region ap-southeast-1
 
 save_state WEBHOOK_SECRET_PARAM_NAME "$WEBHOOK_SECRET_PARAM_NAME"
 save_state APP_CREDENTIALS_PARAM_NAME "$APP_CREDENTIALS_PARAM_NAME"
