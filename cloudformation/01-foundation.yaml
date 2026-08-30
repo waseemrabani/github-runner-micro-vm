@@ -5,8 +5,8 @@ Description: >
   Lambda deployment packages, plus the IAM role Lambda MicroVMs assumes while
   building a MicroVM image. This stack has no dependency on the MicroVM
   images and is always deployable on its own. Deploy this first, then run
-  scripts/02-package-lambdas.sh and scripts/03-build-microvm-images.sh, then
-  deploy cloudformation/02-orchestrator.yaml.
+  scripts/02-package-lambdas.sh and scripts/03-deploy-microvm-images.sh, then
+  deploy cloudformation/03-orchestrator.yaml.
 
 Parameters:
   ProjectName:

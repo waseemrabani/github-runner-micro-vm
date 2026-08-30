@@ -1,8 +1,9 @@
 // Lambda MicroVM lifecycle hook server for the ephemeral GitHub Actions runner.
-// Listens on port 9000 for the /ready, /run and /terminate hooks (see
-// scripts/03-build-microvm-images.sh for how these are registered against
-// the image), and on 8080 as a harmless catch-all (useful when poking the
-// image manually while iterating on it).
+// Listens on port 9000 for the /ready, /run and /terminate hooks (see the
+// Hooks property on the AWS::Lambda::MicrovmImage resources in
+// cloudformation/02-microvm-images.yaml for how these are registered
+// against the image), and on 8080 as a harmless catch-all (useful when
+// poking the image manually while iterating on it).
 'use strict';
 
 const http = require('http');

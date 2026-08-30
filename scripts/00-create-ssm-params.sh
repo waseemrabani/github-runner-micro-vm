@@ -4,9 +4,9 @@
 # Safe to re-run - it overwrites the existing values.
 #
 # Usage:
-  PRIVATE_KEY_PATH=/Users/waseem/Downloads/runner-app.private-key.pem
-  GITHUB_APP_CLIENT_ID=Iv23liQleZxbGv7SyKpG
-  GITHUB_APP_INSTALLATION_ID=156400071
+  # PRIVATE_KEY_PATH=/path/to/runner-app.private-key.pem
+  # GITHUB_APP_CLIENT_ID=Iv............
+  # GITHUB_APP_INSTALLATION_ID=1234567
 #   ./00-create-ssm-params.sh
 #
 # WEBHOOK_SECRET is generated for you (openssl rand -hex 32) if not set in

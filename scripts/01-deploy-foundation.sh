@@ -32,4 +32,4 @@ echo "  MicrovmBuildRoleArn: ${MICROVM_BUILD_ROLE_ARN}"
 echo "  MicrovmBaseImageArn: ${MICROVM_BASE_IMAGE_ARN}"
 echo "  Region:              ${REGION}"
 echo
-echo "Next: ./00-create-ssm-params.sh (if not done already), then ./02-package-lambdas.sh"
+echo "Next: ./00-create-ssm-params.sh (if not done already), then ./02-package-lambdas.sh, then ./03-deploy-microvm-images.sh"

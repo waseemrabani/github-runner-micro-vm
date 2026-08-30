@@ -8,6 +8,7 @@ STATE_FILE="${SCRIPT_DIR}/.deploy-state.env"
 
 : "${PROJECT_NAME:=github-runner-orchestrator}"
 FOUNDATION_STACK_NAME="${PROJECT_NAME}-foundation"
+MICROVM_IMAGES_STACK_NAME="${PROJECT_NAME}-microvm-images"
 ORCHESTRATOR_STACK_NAME="${PROJECT_NAME}-orchestrator"
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }

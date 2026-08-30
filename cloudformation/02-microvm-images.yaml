@@ -1,0 +1,175 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  GitHub Ephemeral Runner Orchestrator - Phase A2 (MicroVM runner images).
+  Creates both MicroVM runner image flavors (plain + Docker-in-Docker) as
+  AWS::Lambda::MicrovmImage resources. Deploy this AFTER
+  cloudformation/01-foundation.yaml, and after the code artifact zips for
+  both flavors have been uploaded to the code bucket -
+  scripts/03-deploy-microvm-images.sh does both the upload and this deploy
+  in one step. Stack creation/update blocks until both image builds reach
+  CREATED/UPDATED (several minutes each) - CloudFormation itself polls the
+  build to completion, there is nothing to poll manually.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: github-runner-orchestrator
+    Description: Must match the ProjectName used for 01-foundation.yaml.
+
+  CodeBucketName:
+    Type: String
+    Description: >
+      S3 bucket name from the 01-foundation.yaml stack's CodeBucketName
+      output.
+
+  MicrovmBuildRoleArn:
+    Type: String
+    Description: >
+      IAM role ARN from the 01-foundation.yaml stack's MicrovmBuildRoleArn
+      output.
+
+  MicrovmBaseImageArn:
+    Type: String
+    Description: >
+      AWS-managed base MicroVM image ARN from the 01-foundation.yaml stack's
+      MicrovmBaseImageArn output.
+
+  MicrovmBaseImageVersion:
+    Type: String
+    Description: >
+      Version of MicrovmBaseImageArn to build both flavors from. Discovered
+      at deploy time from the base image's own current
+      LatestActiveImageVersion (see scripts/03-deploy-microvm-images.sh) -
+      not hardcoded, since AWS updates the managed base image independently
+      of this project.
+
+  NoDockerCodeArtifactKey:
+    Type: String
+    Description: >
+      S3 key (inside CodeBucketName) of the zipped Dockerfile.base + app.js +
+      entrypoint.sh + package.json artifact. The key includes a content
+      hash, so changing any of those files produces a new key on the next
+      deploy - CloudFormation only detects a property VALUE change (a
+      different key), not a change to the bytes an unchanged key already
+      points at, so the hash is what actually triggers a rebuild.
+
+  DockerCodeArtifactKey:
+    Type: String
+    Description: Same as NoDockerCodeArtifactKey, for Dockerfile.docker.
+
+  MinimumMemoryMiB:
+    Type: Number
+    Default: 4096
+    Description: Resources[].MinimumMemoryInMiB for both image flavors.
+
+  NoDockerImageName:
+    Type: String
+    Default: github-runner-no-docker
+    Description: >
+      Name of the plain (no-docker) MicroVM image. Changing this replaces
+      the resource (a new image, not an update to the existing one).
+
+  DockerImageName:
+    Type: String
+    Default: github-runner-docker
+    Description: >
+      Name of the Docker-in-Docker MicroVM image. Changing this replaces
+      the resource (a new image, not an update to the existing one).
+
+Resources:
+  # ══════════════════════════════════════════════════════════════════════
+  # Plain (no-docker) flavor
+  # ══════════════════════════════════════════════════════════════════════
+  MicrovmImageNoDocker:
+    Type: AWS::Lambda::MicrovmImage
+    Properties:
+      Name: !Ref NoDockerImageName
+      Description: !Sub 'Plain (no Docker) ephemeral GitHub Actions runner - ${ProjectName}'
+      BaseImageArn: !Ref MicrovmBaseImageArn
+      BaseImageVersion: !Ref MicrovmBaseImageVersion
+      BuildRoleArn: !Ref MicrovmBuildRoleArn
+      CodeArtifact:
+        Uri: !Sub 's3://${CodeBucketName}/${NoDockerCodeArtifactKey}'
+      CpuConfigurations:
+        - Architecture: ARM_64
+      Resources:
+        - MinimumMemoryInMiB: !Ref MinimumMemoryMiB
+      AdditionalOsCapabilities: []
+      EgressNetworkConnectors: []
+      EnvironmentVariables: []
+      Logging:
+        CloudWatch: {}
+      # Same hook timings as the Docker flavor below - the ready hook gets a
+      # longer budget than run/terminate purely for headroom (dockerState
+      # initializes straight to 'ready' for this flavor, so /ready returns
+      # 200 almost immediately in practice - see microvm/app.js).
+      Hooks:
+        Port: 9000
+        MicrovmImageHooks:
+          Ready: ENABLED
+          ReadyTimeoutInSeconds: 180
+        MicrovmHooks:
+          Run: ENABLED
+          RunTimeoutInSeconds: 30
+          Terminate: ENABLED
+          TerminateTimeoutInSeconds: 30
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Docker-in-Docker flavor
+  # ══════════════════════════════════════════════════════════════════════
+  MicrovmImageDocker:
+    Type: AWS::Lambda::MicrovmImage
+    Properties:
+      Name: !Ref DockerImageName
+      Description: !Sub 'Docker-in-Docker ephemeral GitHub Actions runner - ${ProjectName}'
+      BaseImageArn: !Ref MicrovmBaseImageArn
+      BaseImageVersion: !Ref MicrovmBaseImageVersion
+      BuildRoleArn: !Ref MicrovmBuildRoleArn
+      CodeArtifact:
+        Uri: !Sub 's3://${CodeBucketName}/${DockerCodeArtifactKey}'
+      CpuConfigurations:
+        - Architecture: ARM_64
+      Resources:
+        - MinimumMemoryInMiB: !Ref MinimumMemoryMiB
+      # ALL: required for the Docker-in-Docker daemon to mount filesystems
+      # and manage network namespaces inside the guest.
+      AdditionalOsCapabilities:
+        - ALL
+      EgressNetworkConnectors: []
+      EnvironmentVariables: []
+      Logging:
+        CloudWatch: {}
+      # ready gets the full 180s budget: it's gated on dockerd + dnsmasq
+      # coming up (see microvm/app.js's startDockerDaemon/startDnsmasq) so
+      # both are warm and captured in the snapshot.
+      Hooks:
+        Port: 9000
+        MicrovmImageHooks:
+          Ready: ENABLED
+          ReadyTimeoutInSeconds: 180
+        MicrovmHooks:
+          Run: ENABLED
+          RunTimeoutInSeconds: 30
+          Terminate: ENABLED
+          TerminateTimeoutInSeconds: 30
+
+Outputs:
+  MicrovmImageArnNoDocker:
+    Description: ARN of the plain (no-docker) MicroVM image
+    Value: !Ref MicrovmImageNoDocker
+    Export:
+      Name: !Sub '${AWS::StackName}-MicrovmImageArnNoDocker'
+
+  MicrovmImageArnDocker:
+    Description: ARN of the Docker-in-Docker MicroVM image
+    Value: !Ref MicrovmImageDocker
+    Export:
+      Name: !Sub '${AWS::StackName}-MicrovmImageArnDocker'
+
+  MicrovmImageVersionNoDocker:
+    Description: Current LatestActiveImageVersion of the no-docker image
+    Value: !GetAtt MicrovmImageNoDocker.LatestActiveImageVersion
+
+  MicrovmImageVersionDocker:
+    Description: Current LatestActiveImageVersion of the docker image
+    Value: !GetAtt MicrovmImageDocker.LatestActiveImageVersion

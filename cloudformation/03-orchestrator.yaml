@@ -1,10 +1,10 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   GitHub Ephemeral Runner Orchestrator - Phase B (orchestrator).
-  Deploy this AFTER cloudformation/01-foundation.yaml has been deployed and
-  BOTH MicroVM runner images (docker + no-docker flavors) have been built by
-  scripts/03-build-microvm-images.sh, and the two Lambda deployment packages
-  have been uploaded by scripts/02-package-lambdas.sh.
+  Deploy this AFTER cloudformation/01-foundation.yaml and
+  cloudformation/02-microvm-images.yaml have both been deployed, and the two
+  Lambda deployment packages have been uploaded by
+  scripts/02-package-lambdas.sh.
   Creates: SQS work queue + DLQ, the MicroVM execution role, the Orchestrator
   Lambda (webhook receiver), the Worker Lambda (JIT token mint + MicroVM
   launch), and an HTTP API Gateway endpoint for GitHub to call.
@@ -13,7 +13,7 @@ Parameters:
   ProjectName:
     Type: String
     Default: github-runner-orchestrator
-    Description: Must match the ProjectName used for 01-foundation.yaml.
+    Description: Must match the ProjectName used for 01-foundation.yaml and 02-microvm-images.yaml.
 
   CodeBucketName:
     Type: String
@@ -35,15 +35,17 @@ Parameters:
     Type: String
     AllowedPattern: '^arn:aws[a-zA-Z-]*:lambda:[a-z0-9-]+:\d{12}:microvm-image:.+$'
     Description: >
-      ARN of the built 'github-runner-docker' MicroVM image (Docker-in-Docker
-      flavor), from scripts/03-build-microvm-images.sh output.
+      ARN of the 'github-runner-docker' MicroVM image (Docker-in-Docker
+      flavor), from the 02-microvm-images.yaml stack's
+      MicrovmImageArnDocker output.
 
   MicrovmImageArnNoDocker:
     Type: String
     AllowedPattern: '^arn:aws[a-zA-Z-]*:lambda:[a-z0-9-]+:\d{12}:microvm-image:.+$'
     Description: >
-      ARN of the built 'github-runner-no-docker' MicroVM image (plain
-      flavor), from scripts/03-build-microvm-images.sh output.
+      ARN of the 'github-runner-no-docker' MicroVM image (plain flavor),
+      from the 02-microvm-images.yaml stack's MicrovmImageArnNoDocker
+      output.
 
   WebhookSecretParamName:
     Type: String

@@ -38,4 +38,4 @@ aws s3 cp "$WORKER_ZIP" "s3://${CODE_BUCKET_NAME}/lambda/worker.zip"
 save_state ORCHESTRATOR_CODE_KEY "lambda/orchestrator.zip"
 save_state WORKER_CODE_KEY "lambda/worker.zip"
 
-log "Done. Next: ./03-build-microvm-images.sh both"
+log "Done. Next: ./03-deploy-microvm-images.sh both"
