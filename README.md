@@ -7,6 +7,18 @@ When a workflow needs a runner, GitHub sends a `workflow_job` webhook. A fresh M
 This project is a AWS's own [Lambda MicroVMs documentation](https://docs.aws.amazon.com/lambda/latest/dg/microvms-how-it-works.html) and [aws/agent-toolkit-for-aws's `aws-lambda-microvms` skill](https://github.com/aws/agent-toolkit-for-aws/blob/main/skills/specialized-skills/serverless-skills/aws-lambda-microvms/SKILL.md), with one addition:
 
 - **Both org-level and repo-level runners**, selected with a single `RunnerScope` parameter — the reference implementation only supports organization-level runners.
+
+> **ARM64 only, for now.** AWS Lambda MicroVMs currently supports a single CPU
+> architecture: `CpuConfiguration.Architecture` accepts only `ARM_64` — there
+> is no `X86_64`/AMD64 option today. See AWS's own reference:
+> [`AWS::Lambda::MicrovmImage` `CpuConfiguration` — Allowed values: `ARM_64`](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-properties-lambda-microvmimage-cpuconfiguration.html).
+> Both runner images in `cloudformation/02-microvm-images.yaml` are hardcoded
+> to `ARM_64` to match. If your workflows build container images or binaries
+> that must target `linux/amd64` (e.g. an x86_64-only production fleet), those
+> builds either need to cross-compile under QEMU emulation on this runner
+> (slow for native-dependency-heavy builds) or stay on an x86_64 runner until
+> AWS adds x86_64 support to this service.
+
 ## Architecture
 
 ```mermaid
@@ -108,6 +120,7 @@ Re-running `./03-deploy-microvm-images.sh` after changing `microvm/app.js`, an `
 
 - AWS CLI v2, configured with credentials for the target account/region.
 - Confirm **Lambda MicroVMs is available in your target region**: `aws lambda-microvms list-managed-microvm-images`. This is a new service; it is not in every region yet.
+- **ARM64-only** — this service does not support x86_64/AMD64 yet (see the callout above). Confirm your workflows and their build/runtime targets are ARM64-compatible before deploying.
 - `jq`, `zip`, `npm`/Node.js 22+ locally (only used to package the worker Lambda's `node_modules`).
 - A GitHub App (see below) — GitHub does not let a plain Personal Access Token mint JIT runner tokens.
 
@@ -275,6 +288,7 @@ aws cloudformation delete-stack --stack-name "${PROJECT_NAME:-github-runner-orch
 
 ## References
 - [AWS Lambda MicroVMs — core concepts](https://docs.aws.amazon.com/lambda/latest/dg/microvms-how-it-works.html)
+- [`AWS::Lambda::MicrovmImage` `CpuConfiguration` — Architecture allowed values (`ARM_64` only)](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-properties-lambda-microvmimage-cpuconfiguration.html)
 - [AWS Lambda MicroVMs — IAM and security](https://github.com/aws/agent-toolkit-for-aws/blob/main/skills/specialized-skills/serverless-skills/aws-lambda-microvms/references/iam-and-security.md)
 - [AWS Lambda MicroVMs — networking](https://github.com/aws/agent-toolkit-for-aws/blob/main/skills/specialized-skills/serverless-skills/aws-lambda-microvms/references/networking.md)
 - [GitHub REST API — self-hosted runners (JIT config)](https://docs.github.com/en/rest/actions/self-hosted-runners)
