@@ -1,0 +1,263 @@
+# Smoke test for the Lambda MicroVM runners - every default runner profile,
+# with assertions, so a green run means the deployment works end to end.
+#
+# Copy to .github/workflows/ in a repository the GitHub App is installed on,
+# then Actions -> microvm-runner-smoke -> Run workflow.
+#
+#   plain  (arm64-medium, x64-medium)                 right CPU, Ubuntu 26.04,
+#          toolchain, pre-seeded Python cache, outbound network, NO Docker
+#   docker (arm64-docker-medium, x64-docker-medium)   the above plus a warm
+#          Docker daemon on the right arch, docker build/run, buildx, compose,
+#          DNS from inside containers, and no cross-arch emulation
+#   routing (opt-in: run with "routing_negative_tests") jobs with invalid
+#          labels. They must stay Queued forever AND must not steal the
+#          runners of the jobs above (every runner only carries
+#          [self-hosted, mvm-<profile>]). Check the orchestrator rejected them
+#          (422 in the App's webhook deliveries / UnroutableJobs alarm), that
+#          the 4 jobs above still passed, then cancel the run.
+#
+# Runner labels are 'mvm-<profile>' (RUNNER_LABEL_PREFIX defaults to mvm).
+#
+# Testing more profiles (e.g. *-large): add a matrix entry below - only once
+# that profile is listed in NO_DOCKER_PROFILES / DOCKER_PROFILES and
+# 04-deploy-orchestrator.sh has been re-run, or the job will never start.
+name: microvm-runner-smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      routing_negative_tests:
+        description: "Also queue jobs with invalid runner labels (they must never start - cancel the run afterwards)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ══════════════════════════════════════════════════════════════════════
+  # Plain (no Docker) profiles
+  # ══════════════════════════════════════════════════════════════════════
+  plain:
+    name: plain · ${{ matrix.profile }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: arm64-medium
+            arch: aarch64
+          - profile: x64-medium
+            arch: x86_64
+    runs-on: [self-hosted, "mvm-${{ matrix.profile }}"]
+    timeout-minutes: 15
+    steps:
+      - name: Runner facts
+        run: |
+          . /etc/os-release
+          mem_mib=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1024 ))
+          {
+            echo "### plain · ${{ matrix.profile }}"
+            echo "| check | value |"
+            echo "|---|---|"
+            echo "| OS | $PRETTY_NAME |"
+            echo "| arch | $(uname -m) |"
+            echo "| kernel | $(uname -r) |"
+            echo "| vCPUs visible | $(nproc) |"
+            echo "| memory visible | ${mem_mib} MiB |"
+            echo "| disk / | $(df -h / | awk 'NR==2 {print $2" total, "$4" free"}') |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: CPU architecture matches the profile
+        run: |
+          actual="$(uname -m)"
+          if [ "$actual" != "${{ matrix.arch }}" ]; then
+            echo "::error::profile ${{ matrix.profile }} should run on ${{ matrix.arch }}, got $actual"
+            exit 1
+          fi
+          echo "OK: $actual"
+
+      - name: Ubuntu 26.04
+        run: |
+          . /etc/os-release
+          [ "$VERSION_ID" = "26.04" ] || { echo "::error::expected Ubuntu 26.04, got $PRETTY_NAME"; exit 1; }
+          echo "OK: $PRETTY_NAME"
+
+      - name: Toolchain present
+        run: |
+          set -euo pipefail
+          for c in git curl jq unzip python3 python pip node npm aws; do
+            command -v "$c" >/dev/null || { echo "::error::'$c' not found on PATH"; exit 1; }
+          done
+          git --version; python3 --version; pip --version; node --version; aws --version
+          python3 -c "import ssl, sqlite3, bz2, lzma, readline, ctypes, uuid; print('python stdlib modules OK')"
+
+      - name: No Docker on a plain profile
+        run: |
+          if command -v docker >/dev/null 2>&1; then
+            echo "::error::docker is installed on plain profile ${{ matrix.profile }} - it should only exist on *-docker-* profiles"
+            exit 1
+          fi
+          echo "OK: no docker"
+
+      - name: Outbound network + DNS
+        run: |
+          getent hosts github.com
+          curl -fsS -o /dev/null -w 'github.com -> HTTP %{http_code}\n' https://github.com
+          curl -fsS -o /dev/null -w 'pypi.org   -> HTTP %{http_code}\n' https://pypi.org/simple/pip/
+
+      - name: actions/checkout works
+        uses: actions/checkout@v4
+
+      - name: actions/setup-python resolves from the pre-seeded tool cache
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: pip install works
+        run: |
+          python -m pip install --quiet --user requests
+          python -c "import requests; print('requests', requests.__version__)"
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Docker-in-Docker profiles
+  # ══════════════════════════════════════════════════════════════════════
+  docker:
+    name: docker · ${{ matrix.profile }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: arm64-docker-medium
+            arch: aarch64
+            docker_arch: arm64
+            platform: linux/arm64
+            other_platform: linux/amd64
+          - profile: x64-docker-medium
+            arch: x86_64
+            docker_arch: amd64
+            platform: linux/amd64
+            other_platform: linux/arm64
+    runs-on: [self-hosted, "mvm-${{ matrix.profile }}"]
+    timeout-minutes: 20
+    steps:
+      - name: Runner facts
+        run: |
+          . /etc/os-release
+          mem_mib=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1024 ))
+          {
+            echo "### docker · ${{ matrix.profile }}"
+            echo "| check | value |"
+            echo "|---|---|"
+            echo "| OS | $PRETTY_NAME |"
+            echo "| arch | $(uname -m) |"
+            echo "| vCPUs visible | $(nproc) |"
+            echo "| memory visible | ${mem_mib} MiB |"
+            echo "| disk / | $(df -h / | awk 'NR==2 {print $2" total, "$4" free"}') |"
+            echo "| docker | $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo missing) |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: CPU architecture matches the profile
+        run: |
+          actual="$(uname -m)"
+          [ "$actual" = "${{ matrix.arch }}" ] || { echo "::error::expected ${{ matrix.arch }}, got $actual"; exit 1; }
+          echo "OK: $actual"
+
+      - name: Ubuntu 26.04
+        run: |
+          . /etc/os-release
+          [ "$VERSION_ID" = "26.04" ] || { echo "::error::expected Ubuntu 26.04, got $PRETTY_NAME"; exit 1; }
+          echo "OK: $PRETTY_NAME"
+
+      - name: Docker daemon is up (warm from the snapshot) on the right arch
+        run: |
+          set -euo pipefail
+          docker version
+          daemon_arch="$(docker info --format '{{.Architecture}}')"
+          [ "$daemon_arch" = "${{ matrix.arch }}" ] || { echo "::error::docker daemon arch $daemon_arch, expected ${{ matrix.arch }}"; exit 1; }
+          docker buildx version
+          docker compose version
+          echo "OK: daemon on $daemon_arch, buildx + compose present"
+
+      - name: Build and run a native image
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/smoke" && cd "$RUNNER_TEMP/smoke"
+          cat > Dockerfile <<'EOF'
+          FROM alpine:3.20
+          # Network + DNS during the build (dockerd --dns -> dnsmasq forwarder)
+          RUN apk add --no-cache curl ca-certificates && curl -fsSI https://github.com | head -1
+          CMD ["uname", "-m"]
+          EOF
+          docker build --progress=plain -t smoke:native .
+          image_arch="$(docker image inspect smoke:native --format '{{.Architecture}}')"
+          [ "$image_arch" = "${{ matrix.docker_arch }}" ] || { echo "::error::image built for $image_arch, expected ${{ matrix.docker_arch }}"; exit 1; }
+          ran_on="$(docker run --rm smoke:native)"
+          [ "$ran_on" = "${{ matrix.arch }}" ] || { echo "::error::container reports $ran_on, expected ${{ matrix.arch }}"; exit 1; }
+          echo "OK: built $image_arch image, container runs on $ran_on"
+
+      - name: DNS and egress from inside a running container
+        run: |
+          docker run --rm alpine:3.20 sh -c 'nslookup github.com >/dev/null && wget -q -O /dev/null https://github.com && echo "OK: container DNS + HTTPS"'
+
+      - name: buildx build for the native platform
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/smoke"
+          docker buildx build --platform "${{ matrix.platform }}" --load -t smoke:buildx .
+          docker image inspect smoke:buildx --format 'OK: buildx image {{.Os}}/{{.Architecture}}'
+
+      - name: docker compose
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/compose" && cd "$RUNNER_TEMP/compose"
+          cat > compose.yaml <<'EOF'
+          services:
+            web:
+              image: nginx:alpine
+            probe:
+              image: alpine:3.20
+              depends_on: [web]
+              command: ["sh", "-c", "for i in 1 2 3 4 5 6 7 8 9 10; do wget -q -O /dev/null http://web/ && echo 'OK: service-to-service networking' && exit 0; sleep 1; done; exit 1"]
+          EOF
+          docker compose up --abort-on-container-exit --exit-code-from probe
+          docker compose down -v
+
+      - name: Other architecture is not emulated (expected to fail)
+        run: |
+          if docker run --rm --platform "${{ matrix.other_platform }}" alpine:3.20 uname -m 2>&1; then
+            echo "::warning::${{ matrix.other_platform }} ran on a ${{ matrix.arch }} runner - QEMU/binfmt emulation is installed"
+          else
+            echo "OK: no cross-arch emulation - build ${{ matrix.other_platform }} on its own profile instead"
+          fi
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Routing negative tests (opt-in). Every job here MUST stay Queued: the
+  # orchestrator rejects it (HTTP 422 in the App's Recent Deliveries,
+  # UnroutableJobs metric + alarm, "Cannot route job" in its log).
+  # Cancel the workflow run once you've checked that.
+  # ══════════════════════════════════════════════════════════════════════
+  routing-must-not-start:
+    if: ${{ inputs.routing_negative_tests }}
+    name: must stay queued · ${{ matrix.case }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: legacy gate label only
+            labels: '["self-hosted", "lambda-microvms"]'
+          - case: legacy gate + profile labels
+            labels: '["self-hosted", "lambda-microvms", "arm64-docker-medium"]'
+          - case: bare prefix
+            labels: '["self-hosted", "mvm"]'
+          - case: two profile labels
+            labels: '["self-hosted", "mvm-arm64-medium", "mvm-x64-medium"]'
+          - case: extra label
+            labels: '["self-hosted", "mvm-x64-medium", "linux"]'
+          - case: profile not deployed
+            labels: '["self-hosted", "mvm-x64-docker-large"]'
+    runs-on: ${{ fromJSON(matrix.labels) }}
+    steps:
+      - name: Routing is broken if this runs
+        run: |
+          echo "::error::a job with labels ${{ matrix.labels }} got a runner - it should match no runner at all"
+          exit 1

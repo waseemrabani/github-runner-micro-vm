@@ -1,3 +1,5 @@
 node_modules/
 .env
 *.env
+# Local deploy state (account IDs, ARNs, webhook URL) - never commit
+scripts/.deploy-state.env*

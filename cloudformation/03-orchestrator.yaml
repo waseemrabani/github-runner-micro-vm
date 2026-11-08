@@ -31,21 +31,47 @@ Parameters:
     Default: lambda/worker.zip
     Description: S3 key of the worker Lambda zip inside CodeBucketName.
 
-  MicrovmImageArnDocker:
-    Type: String
-    AllowedPattern: '^arn:aws[a-zA-Z-]*:lambda:[a-z0-9-]+:\d{12}:microvm-image:.+$'
+  NoDockerProfiles:
+    Type: CommaDelimitedList
     Description: >
-      ARN of the 'github-runner-docker' MicroVM image (Docker-in-Docker
-      flavor), from the 02-microvm-images.yaml stack's
-      MicrovmImageArnDocker output.
+      Plain runner profiles, from the 02-microvm-images.yaml stack's
+      NoDockerProfiles output. Each profile's image is
+      '<ProjectName>-<profile>'.
 
-  MicrovmImageArnNoDocker:
-    Type: String
-    AllowedPattern: '^arn:aws[a-zA-Z-]*:lambda:[a-z0-9-]+:\d{12}:microvm-image:.+$'
+  DockerProfiles:
+    Type: CommaDelimitedList
     Description: >
-      ARN of the 'github-runner-no-docker' MicroVM image (plain flavor),
-      from the 02-microvm-images.yaml stack's MicrovmImageArnNoDocker
-      output.
+      Docker-in-Docker runner profiles, from the 02-microvm-images.yaml
+      stack's DockerProfiles output.
+
+  MicrovmLogGroupName:
+    Type: String
+    Description: >
+      Shared MicroVM log group, from the 02-microvm-images.yaml stack's
+      MicrovmLogGroupName output. The worker names each runtime log stream
+      '<profile>/<runner-name>' in it. Also the only log group the MicroVM
+      execution role may write to.
+
+  RunnerImageArns:
+    Type: CommaDelimitedList
+    Description: >
+      Exact ARN of every deployed runner profile image (MicrovmImageArnPrefix
+      output of the images stack + each profile name; built by
+      scripts/04-deploy-orchestrator.sh). RunMicrovm and the in-VM
+      TerminateMicrovm are granted on these ARNs only - not on a
+      '<ProjectName>-*' wildcard that could also match another project's
+      images whose name happens to share the prefix.
+
+  MetricsNamespace:
+    Type: String
+    Default: GitHubRunnerMicroVMs
+    Description: >
+      CloudWatch namespace for the custom metrics both Lambdas publish (via
+      the Embedded Metric Format). MicroVMs publish their resource metrics
+      to '<MetricsNamespace>/Runner' instead, and that sub-namespace is all
+      the execution role may write - workflow code inside a runner can use
+      the role, so it must not be able to forge the Lambda metrics the
+      alarms watch. Must match the images and observability stacks.
 
   WebhookSecretParamName:
     Type: String
@@ -90,17 +116,17 @@ Parameters:
       unless you know you need a different group (organization scope
       only; repos only ever have the implicit default group).
 
-  RequiredRunnerLabel:
+  RunnerLabelPrefix:
     Type: String
-    Default: lambda-microvms
-    Description: A queued workflow_job must carry this label to trigger a runner.
-
-  DockerRunnerLabel:
-    Type: String
-    Default: docker
+    Default: mvm
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*$'
     Description: >
-      A queued job carrying this label (in addition to RequiredRunnerLabel)
-      launches the Docker-in-Docker image instead of the plain image.
+      A job requests a runner with the single label '<prefix>-<profile>'
+      (e.g. mvm-x64-docker-medium), alongside an optional 'self-hosted', and
+      nothing else. Each runner is registered with exactly
+      [self-hosted, <prefix>-<profile>], so it can only take jobs for its
+      own profile, and a job without a profile label can never take a
+      runner meant for another job.
 
   MicrovmMaxIdleSeconds:
     Type: Number
@@ -150,7 +176,8 @@ Resources:
   # MicrovmExecutionRole - assumed by the running MicroVM itself (exposed
   # inside the guest via IMDSv2, picked up automatically by the AWS SDK's
   # default credential chain in microvm/app.js). Used only to self
-  # -terminate after the job finishes and to ship stdout to CloudWatch.
+  # -terminate after the job finishes, to ship stdout to CloudWatch, and to
+  # publish the job's CPU/memory/disk usage metrics.
   #
   # lambda:TerminateMicrovm is scoped to the microvm:* resource (the
   # RUNNING instance), not the microvm-image:* resource - the reference
@@ -201,18 +228,40 @@ Resources:
                 # shapes since we've now seen conflicting behavior between
                 # documented and observed: the reference CDK repo's
                 # original image-ARN scoping was right for this exact
-                # self-call path.
-                Resource:
-                  - !Ref MicrovmImageArnDocker
-                  - !Ref MicrovmImageArnNoDocker
-                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm:*'
+                # self-call path. Image ARNs are listed exactly (the deployed
+                # profiles), joined with the instance-ARN form.
+                Resource: !Split
+                  - ','
+                  - !Join
+                    - ','
+                    - - !Join [',', !Ref RunnerImageArns]
+                      - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm:*'
+              - Sid: PublishResourceMetrics
+                Effect: Allow
+                # microvm/app.js samples CPU/memory/disk while a job runs.
+                # PutMetricData has no resource-level permissions; the
+                # namespace condition is the scoping. Workflow code can use
+                # this role too, so it gets the '/Runner' sub-namespace
+                # only and can't forge the Lambda-emitted metrics in
+                # MetricsNamespace that the alarms watch.
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: !Sub '${MetricsNamespace}/Runner'
               - Sid: ShipLogs
                 Effect: Allow
+                # The platform streams the VM's stdout with this role, into
+                # the shared log group the images and the worker point at.
+                # Scoped to that one group so workflow code can't write into
+                # other MicroVM log groups in the account.
                 Action:
                   - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvents
-                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda-microvms/*'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${MicrovmLogGroupName}'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${MicrovmLogGroupName}:*'
 
   # ══════════════════════════════════════════════════════════════════════
   # Orchestrator Lambda - webhook receiver
@@ -273,9 +322,11 @@ Resources:
       Environment:
         Variables:
           WEBHOOK_SECRET_PARAM: !Ref WebhookSecretParamName
-          REQUIRED_RUNNER_LABEL: !Ref RequiredRunnerLabel
+          RUNNER_LABEL_PREFIX: !Ref RunnerLabelPrefix
           QUEUE_URL: !Ref WebhookQueue
           RUNNER_SCOPE: !Ref RunnerScope
+          RUNNER_PROFILES: !Join [',', [!Join [',', !Ref NoDockerProfiles], !Join [',', !Ref DockerProfiles]]]
+          METRICS_NAMESPACE: !Ref MetricsNamespace
 
   # ══════════════════════════════════════════════════════════════════════
   # Worker Lambda - mints JIT credentials and launches the MicroVM
@@ -322,9 +373,10 @@ Resources:
               - Sid: RunMicrovm
                 Effect: Allow
                 Action: lambda:RunMicrovm
-                Resource:
-                  - !Ref MicrovmImageArnDocker
-                  - !Ref MicrovmImageArnNoDocker
+                # Exactly the deployed profile images. Adding a profile
+                # already requires re-running 04-deploy-orchestrator.sh
+                # (for routing), which refreshes this list too.
+                Resource: !Ref RunnerImageArns
               - Sid: PassNetworkConnectors
                 Effect: Allow
                 # Required for EVERY RunMicrovm call, even with no explicit
@@ -366,10 +418,11 @@ Resources:
           GITHUB_APP_CREDENTIALS_PARAM: !Ref AppCredentialsParamName
           RUNNER_SCOPE: !Ref RunnerScope
           RUNNER_GROUP_ID: !Ref RunnerGroupId
-          REQUIRED_RUNNER_LABEL: !Ref RequiredRunnerLabel
-          DOCKER_RUNNER_LABEL: !Ref DockerRunnerLabel
-          MICROVM_IMAGE_IDENTIFIER_DOCKER: !Ref MicrovmImageArnDocker
-          MICROVM_IMAGE_IDENTIFIER_NO_DOCKER: !Ref MicrovmImageArnNoDocker
+          RUNNER_PROFILES: !Join [',', [!Join [',', !Ref NoDockerProfiles], !Join [',', !Ref DockerProfiles]]]
+          RUNNER_LABEL_PREFIX: !Ref RunnerLabelPrefix
+          MICROVM_IMAGE_ARN_PREFIX: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ProjectName}-'
+          MICROVM_LOG_GROUP: !Ref MicrovmLogGroupName
+          METRICS_NAMESPACE: !Ref MetricsNamespace
           MICROVM_EXECUTION_ROLE_ARN: !GetAtt MicrovmExecutionRole.Arn
           MICROVM_INGRESS_NETWORK_CONNECTORS: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:NO_INGRESS'
           MICROVM_EGRESS_NETWORK_CONNECTORS: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:INTERNET_EGRESS'
@@ -453,3 +506,7 @@ Outputs:
 
   RunnerScope:
     Value: !Ref RunnerScope
+
+  RunnerProfiles:
+    Description: Profile labels this deployment routes (comma-separated)
+    Value: !Join [',', [!Join [',', !Ref NoDockerProfiles], !Join [',', !Ref DockerProfiles]]]

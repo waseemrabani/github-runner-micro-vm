@@ -1,20 +1,63 @@
 AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::LanguageExtensions
 Description: >
   GitHub Ephemeral Runner Orchestrator - Phase A2 (MicroVM runner images).
-  Creates both MicroVM runner image flavors (plain + Docker-in-Docker) as
-  AWS::Lambda::MicrovmImage resources. Deploy this AFTER
+  Creates one AWS::Lambda::MicrovmImage per enabled runner profile. A profile
+  is a CPU architecture (ARM_64 / X86_64) x flavor (plain / Docker-in-Docker)
+  x size (baseline memory), and its name doubles as the runs-on label a
+  workflow job uses to select it. Deploy this AFTER
   cloudformation/01-foundation.yaml, and after the code artifact zips for
   both flavors have been uploaded to the code bucket -
   scripts/03-deploy-microvm-images.sh does both the upload and this deploy
-  in one step. Stack creation/update blocks until both image builds reach
+  in one step. Stack creation/update blocks until every image build reaches
   CREATED/UPDATED (several minutes each) - CloudFormation itself polls the
-  build to completion, there is nothing to poll manually.
+  builds to completion, there is nothing to poll manually.
+
+# ──────────────────────────────────────────────────────────────────────────
+# Runner profiles. Add, resize or remove profiles here, then list the ones
+# you want built in NoDockerProfiles / DockerProfiles below.
+#
+# Architecture: ARM_64 | X86_64. X86_64 needs base image version 3 or later
+#   (scripts/03-deploy-microvm-images.sh picks a version that supports every
+#   architecture in REQUIRED_ARCHS).
+# MemoryMiB: the image's BASELINE memory. vCPU scales with it (2 GiB = 1
+#   vCPU) and a running MicroVM can burst to 4x baseline, billed per second
+#   for what it actually uses above baseline. Disk is fixed per tier:
+#     MemoryMiB  baseline           peak               disk
+#       512      0.5 GB / 0.25 vCPU  2 GB /  1 vCPU     8 GB
+#      1024      1 GB / 0.5 vCPU     4 GB /  2 vCPU     8 GB
+#      2048      2 GB / 1 vCPU       8 GB /  4 vCPU     8 GB
+#      4096      4 GB / 2 vCPU      16 GB /  8 vCPU    16 GB
+#      8192      8 GB / 4 vCPU      32 GB / 16 vCPU    32 GB
+#   (https://docs.aws.amazon.com/lambda/latest/dg/microvms-images.html#microvms-images-sizing)
+#   Docker profiles should be 4096+: image layers and build cache live on
+#   the MicroVM's own disk, and 8 GB fills up quickly.
+#
+# Profile names must be lowercase, unique, and at most
+# (63 - len(ProjectName)) characters, since the image is named
+# '<ProjectName>-<profile>'.
+# ──────────────────────────────────────────────────────────────────────────
+Mappings:
+  Profiles:
+    arm64-small:         { Architecture: ARM_64, MemoryMiB: '2048' }
+    arm64-medium:        { Architecture: ARM_64, MemoryMiB: '4096' }
+    arm64-large:         { Architecture: ARM_64, MemoryMiB: '8192' }
+    x64-small:           { Architecture: X86_64, MemoryMiB: '2048' }
+    x64-medium:          { Architecture: X86_64, MemoryMiB: '4096' }
+    x64-large:           { Architecture: X86_64, MemoryMiB: '8192' }
+    arm64-docker-medium: { Architecture: ARM_64, MemoryMiB: '4096' }
+    arm64-docker-large:  { Architecture: ARM_64, MemoryMiB: '8192' }
+    x64-docker-medium:   { Architecture: X86_64, MemoryMiB: '4096' }
+    x64-docker-large:    { Architecture: X86_64, MemoryMiB: '8192' }
 
 Parameters:
   ProjectName:
     Type: String
     Default: github-runner-orchestrator
-    Description: Must match the ProjectName used for 01-foundation.yaml.
+    Description: >
+      Must match the ProjectName used for 01-foundation.yaml. Also the
+      prefix of every image name ('<ProjectName>-<profile>'), which the
+      orchestrator stack relies on to build image ARNs and scope IAM.
 
   CodeBucketName:
     Type: String
@@ -37,139 +80,197 @@ Parameters:
   MicrovmBaseImageVersion:
     Type: String
     Description: >
-      Version of MicrovmBaseImageArn to build both flavors from. Discovered
-      at deploy time from the base image's own current
-      LatestActiveImageVersion (see scripts/03-deploy-microvm-images.sh) -
-      not hardcoded, since AWS updates the managed base image independently
-      of this project.
+      Version of MicrovmBaseImageArn to build every profile from. Discovered
+      at deploy time (see scripts/03-deploy-microvm-images.sh): the newest
+      AVAILABLE version that supports every architecture the enabled
+      profiles use - not hardcoded, since AWS updates the managed base image
+      independently of this project.
 
   NoDockerCodeArtifactKey:
     Type: String
     Description: >
       S3 key (inside CodeBucketName) of the zipped Dockerfile.base + app.js +
-      entrypoint.sh + package.json artifact. The key includes a content
-      hash, so changing any of those files produces a new key on the next
-      deploy - CloudFormation only detects a property VALUE change (a
-      different key), not a change to the bytes an unchanged key already
-      points at, so the hash is what actually triggers a rebuild.
+      entrypoint.sh + package.json artifact. Shared by every plain profile,
+      on both architectures (the Dockerfile detects the architecture it is
+      being built on). The key includes a content hash, so changing any of
+      those files produces a new key on the next deploy - CloudFormation
+      only detects a property VALUE change (a different key), not a change
+      to the bytes an unchanged key already points at, so the hash is what
+      actually triggers a rebuild.
 
   DockerCodeArtifactKey:
     Type: String
     Description: Same as NoDockerCodeArtifactKey, for Dockerfile.docker.
 
-  MinimumMemoryMiB:
+  NoDockerProfiles:
+    Type: CommaDelimitedList
+    Default: arm64-medium,x64-medium
+    Description: >
+      Profiles (keys of the Profiles mapping) to build from the plain
+      Dockerfile.base. Must list at least one. Removing a profile deletes
+      its image.
+
+  DockerProfiles:
+    Type: CommaDelimitedList
+    Default: arm64-docker-medium,x64-docker-medium
+    Description: >
+      Profiles (keys of the Profiles mapping) to build from the
+      Docker-in-Docker Dockerfile.docker. Must list at least one. Removing a
+      profile deletes its image.
+
+  MetricsNamespace:
+    Type: String
+    Default: GitHubRunnerMicroVMs
+    Description: >
+      Base CloudWatch namespace. The in-VM resource sampler
+      (microvm/app.js) publishes CPU/memory/disk metrics to
+      '<MetricsNamespace>/Runner' - a sub-namespace the execution role is
+      limited to, so workflow code can't forge the Lambda metrics alarms
+      watch. Must match the orchestrator and observability stacks.
+
+  MicrovmLogRetentionDays:
     Type: Number
-    Default: 4096
-    Description: Resources[].MinimumMemoryInMiB for both image flavors.
-
-  NoDockerImageName:
-    Type: String
-    Default: github-runner-no-docker
-    Description: >
-      Name of the plain (no-docker) MicroVM image. Changing this replaces
-      the resource (a new image, not an update to the existing one).
-
-  DockerImageName:
-    Type: String
-    Default: github-runner-docker
-    Description: >
-      Name of the Docker-in-Docker MicroVM image. Changing this replaces
-      the resource (a new image, not an update to the existing one).
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    Description: Retention for the shared MicroVM build + runtime log group.
 
 Resources:
-  # ══════════════════════════════════════════════════════════════════════
-  # Plain (no-docker) flavor
-  # ══════════════════════════════════════════════════════════════════════
-  MicrovmImageNoDocker:
-    Type: AWS::Lambda::MicrovmImage
+  # ──────────────────────────────────────────────────────────────────────
+  # One log group for every profile's build and runtime output, created
+  # here (rather than left to the service's per-image default
+  # /aws/lambda-microvms/<image-name>, which never expires) so it has a
+  # retention policy and one Logs Insights query covers the whole fleet.
+  # The worker Lambda names each runtime stream '<profile>/<runner-name>'
+  # (see lambda/worker/microvms.js), so a job's VM log is findable from the
+  # run id alone. Both the build role and the execution role already allow
+  # writes under /aws/lambda-microvms/*.
+  # ──────────────────────────────────────────────────────────────────────
+  MicrovmLogGroup:
+    Type: AWS::Logs::LogGroup
     Properties:
-      Name: !Ref NoDockerImageName
-      Description: !Sub 'Plain (no Docker) ephemeral GitHub Actions runner - ${ProjectName}'
-      BaseImageArn: !Ref MicrovmBaseImageArn
-      BaseImageVersion: !Ref MicrovmBaseImageVersion
-      BuildRoleArn: !Ref MicrovmBuildRoleArn
-      CodeArtifact:
-        Uri: !Sub 's3://${CodeBucketName}/${NoDockerCodeArtifactKey}'
-      CpuConfigurations:
-        - Architecture: ARM_64
-      Resources:
-        - MinimumMemoryInMiB: !Ref MinimumMemoryMiB
-      AdditionalOsCapabilities: []
-      EgressNetworkConnectors: []
-      EnvironmentVariables: []
-      Logging:
-        CloudWatch: {}
-      # Same hook timings as the Docker flavor below - the ready hook gets a
-      # longer budget than run/terminate purely for headroom (dockerState
-      # initializes straight to 'ready' for this flavor, so /ready returns
-      # 200 almost immediately in practice - see microvm/app.js).
-      Hooks:
-        Port: 9000
-        MicrovmImageHooks:
-          Ready: ENABLED
-          ReadyTimeoutInSeconds: 180
-        MicrovmHooks:
-          Run: ENABLED
-          RunTimeoutInSeconds: 30
-          Terminate: ENABLED
-          TerminateTimeoutInSeconds: 30
+      LogGroupName: !Sub '/aws/lambda-microvms/${ProjectName}'
+      RetentionInDays: !Ref MicrovmLogRetentionDays
 
   # ══════════════════════════════════════════════════════════════════════
-  # Docker-in-Docker flavor
+  # Plain (no-docker) profiles
   # ══════════════════════════════════════════════════════════════════════
-  MicrovmImageDocker:
-    Type: AWS::Lambda::MicrovmImage
-    Properties:
-      Name: !Ref DockerImageName
-      Description: !Sub 'Docker-in-Docker ephemeral GitHub Actions runner - ${ProjectName}'
-      BaseImageArn: !Ref MicrovmBaseImageArn
-      BaseImageVersion: !Ref MicrovmBaseImageVersion
-      BuildRoleArn: !Ref MicrovmBuildRoleArn
-      CodeArtifact:
-        Uri: !Sub 's3://${CodeBucketName}/${DockerCodeArtifactKey}'
-      CpuConfigurations:
-        - Architecture: ARM_64
-      Resources:
-        - MinimumMemoryInMiB: !Ref MinimumMemoryMiB
-      # ALL: required for the Docker-in-Docker daemon to mount filesystems
-      # and manage network namespaces inside the guest.
-      AdditionalOsCapabilities:
-        - ALL
-      EgressNetworkConnectors: []
-      EnvironmentVariables: []
-      Logging:
-        CloudWatch: {}
-      # ready gets the full 180s budget: it's gated on dockerd + dnsmasq
-      # coming up (see microvm/app.js's startDockerDaemon/startDnsmasq) so
-      # both are warm and captured in the snapshot.
-      Hooks:
-        Port: 9000
-        MicrovmImageHooks:
-          Ready: ENABLED
-          ReadyTimeoutInSeconds: 180
-        MicrovmHooks:
-          Run: ENABLED
-          RunTimeoutInSeconds: 30
-          Terminate: ENABLED
-          TerminateTimeoutInSeconds: 30
+  Fn::ForEach::NoDockerImages:
+    - Profile
+    - !Ref NoDockerProfiles
+    - NoDockerImage&{Profile}:
+        Type: AWS::Lambda::MicrovmImage
+        Properties:
+          Name: !Sub '${ProjectName}-${Profile}'
+          Description: !Sub 'Plain (no Docker) ephemeral GitHub Actions runner, profile ${Profile} - ${ProjectName}'
+          BaseImageArn: !Ref MicrovmBaseImageArn
+          BaseImageVersion: !Ref MicrovmBaseImageVersion
+          BuildRoleArn: !Ref MicrovmBuildRoleArn
+          CodeArtifact:
+            Uri: !Sub 's3://${CodeBucketName}/${NoDockerCodeArtifactKey}'
+          CpuConfigurations:
+            - Architecture: !FindInMap [Profiles, !Ref Profile, Architecture]
+          Resources:
+            - MinimumMemoryInMiB: !FindInMap [Profiles, !Ref Profile, MemoryMiB]
+          AdditionalOsCapabilities: []
+          EgressNetworkConnectors: []
+          # Read by microvm/app.js to label the metrics it publishes.
+          EnvironmentVariables:
+            - Key: RUNNER_PROFILE
+              Value: !Ref Profile
+            - Key: RUNNER_METRICS_NAMESPACE
+              Value: !Sub '${MetricsNamespace}/Runner'
+          Logging:
+            CloudWatch:
+              LogGroup: !Ref MicrovmLogGroup
+          Tags:
+            - Key: Project
+              Value: !Ref ProjectName
+            - Key: RunnerProfile
+              Value: !Ref Profile
+          # Same hook timings as the Docker flavor below - the ready hook gets
+          # a longer budget than run/terminate purely for headroom
+          # (dockerState initializes straight to 'ready' for this flavor, so
+          # /ready returns 200 almost immediately in practice - see
+          # microvm/app.js).
+          Hooks:
+            Port: 9000
+            MicrovmImageHooks:
+              Ready: ENABLED
+              ReadyTimeoutInSeconds: 180
+            MicrovmHooks:
+              Run: ENABLED
+              RunTimeoutInSeconds: 30
+              Terminate: ENABLED
+              TerminateTimeoutInSeconds: 30
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Docker-in-Docker profiles
+  # ══════════════════════════════════════════════════════════════════════
+  Fn::ForEach::DockerImages:
+    - Profile
+    - !Ref DockerProfiles
+    - DockerImage&{Profile}:
+        Type: AWS::Lambda::MicrovmImage
+        Properties:
+          Name: !Sub '${ProjectName}-${Profile}'
+          Description: !Sub 'Docker-in-Docker ephemeral GitHub Actions runner, profile ${Profile} - ${ProjectName}'
+          BaseImageArn: !Ref MicrovmBaseImageArn
+          BaseImageVersion: !Ref MicrovmBaseImageVersion
+          BuildRoleArn: !Ref MicrovmBuildRoleArn
+          CodeArtifact:
+            Uri: !Sub 's3://${CodeBucketName}/${DockerCodeArtifactKey}'
+          CpuConfigurations:
+            - Architecture: !FindInMap [Profiles, !Ref Profile, Architecture]
+          Resources:
+            - MinimumMemoryInMiB: !FindInMap [Profiles, !Ref Profile, MemoryMiB]
+          # ALL: required for the Docker-in-Docker daemon to mount filesystems
+          # and manage network namespaces inside the guest.
+          AdditionalOsCapabilities:
+            - ALL
+          EgressNetworkConnectors: []
+          EnvironmentVariables:
+            - Key: RUNNER_PROFILE
+              Value: !Ref Profile
+            - Key: RUNNER_METRICS_NAMESPACE
+              Value: !Sub '${MetricsNamespace}/Runner'
+          Logging:
+            CloudWatch:
+              LogGroup: !Ref MicrovmLogGroup
+          Tags:
+            - Key: Project
+              Value: !Ref ProjectName
+            - Key: RunnerProfile
+              Value: !Ref Profile
+          # ready gets the full 180s budget: it's gated on dockerd + dnsmasq
+          # coming up (see microvm/app.js's startDockerDaemon/startDnsmasq)
+          # so both are warm and captured in the snapshot.
+          Hooks:
+            Port: 9000
+            MicrovmImageHooks:
+              Ready: ENABLED
+              ReadyTimeoutInSeconds: 180
+            MicrovmHooks:
+              Run: ENABLED
+              RunTimeoutInSeconds: 30
+              Terminate: ENABLED
+              TerminateTimeoutInSeconds: 30
 
 Outputs:
-  MicrovmImageArnNoDocker:
-    Description: ARN of the plain (no-docker) MicroVM image
-    Value: !Ref MicrovmImageNoDocker
-    Export:
-      Name: !Sub '${AWS::StackName}-MicrovmImageArnNoDocker'
+  # The orchestrator stack takes these straight through: image ARNs are
+  # derived from '<ProjectName>-<profile>', so the profile lists are all it
+  # needs to route jobs and scope IAM.
+  NoDockerProfiles:
+    Description: Plain profiles built by this stack (comma-separated)
+    Value: !Join [',', !Ref NoDockerProfiles]
 
-  MicrovmImageArnDocker:
-    Description: ARN of the Docker-in-Docker MicroVM image
-    Value: !Ref MicrovmImageDocker
-    Export:
-      Name: !Sub '${AWS::StackName}-MicrovmImageArnDocker'
+  DockerProfiles:
+    Description: Docker-in-Docker profiles built by this stack (comma-separated)
+    Value: !Join [',', !Ref DockerProfiles]
 
-  MicrovmImageVersionNoDocker:
-    Description: Current LatestActiveImageVersion of the no-docker image
-    Value: !GetAtt MicrovmImageNoDocker.LatestActiveImageVersion
+  MicrovmLogGroupName:
+    Description: Shared build + runtime log group for every runner profile
+    Value: !Ref MicrovmLogGroup
 
-  MicrovmImageVersionDocker:
-    Description: Current LatestActiveImageVersion of the docker image
-    Value: !GetAtt MicrovmImageDocker.LatestActiveImageVersion
+  MicrovmImageArnPrefix:
+    Description: Image ARN of profile P is this prefix followed by P
+    Value: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ProjectName}-'

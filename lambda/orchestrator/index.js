@@ -3,12 +3,17 @@
 const crypto = require('node:crypto');
 const { SSMClient, GetParameterCommand } = require('@aws-sdk/client-ssm');
 const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
-const { parseWorkflowJobEvent, matchesRunnerRequest, resolveTarget } = require('./filter');
+const { parseWorkflowJobEvent, resolveTarget, resolveProfile, elapsedMs } = require('./filter');
+const { putMetric } = require('./metrics');
 
 const WEBHOOK_SECRET_PARAM = process.env.WEBHOOK_SECRET_PARAM;
-const REQUIRED_LABEL = process.env.REQUIRED_RUNNER_LABEL ?? 'lambda-microvms';
+const LABEL_PREFIX = process.env.RUNNER_LABEL_PREFIX || 'mvm';
 const QUEUE_URL = process.env.QUEUE_URL;
 const RUNNER_SCOPE = process.env.RUNNER_SCOPE ?? 'organization'; // 'organization' | 'repository'
+const RUNNER_PROFILES = (process.env.RUNNER_PROFILES ?? '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 const ssm = new SSMClient({});
 const sqs = new SQSClient({});
@@ -33,6 +38,44 @@ getWebhookSecret().catch(() => undefined);
 
 const reply = (statusCode, body) => ({ statusCode, body });
 
+function replyError(statusCode, body) {
+  putMetric('WebhookErrors', 1, 'Count');
+  return reply(statusCode, body);
+}
+
+/**
+ * in_progress / completed events for our own jobs carry no work for us, but
+ * they are the only place GitHub reports how long a job actually waited for
+ * a runner and how it ended - so turn them into metrics.
+ */
+function recordJobLifecycle(event, route) {
+  const job = event.workflow_job ?? {};
+  const dims = route.ok ? { Profile: route.profile } : {};
+  const props = {
+    runId: job.run_id,
+    jobId: job.id,
+    repo: event.repository?.full_name,
+    workflow: job.workflow_name,
+    job: job.name,
+    runnerName: job.runner_name,
+  };
+
+  if (event.action === 'in_progress') {
+    const queueMs = elapsedMs(job.created_at, job.started_at);
+    if (queueMs !== undefined) putMetric('JobQueueTime', queueMs, 'Milliseconds', dims, props);
+    return;
+  }
+
+  if (event.action === 'completed') {
+    const conclusion = job.conclusion ?? 'unknown';
+    putMetric('JobsCompleted', 1, 'Count', { ...dims, Conclusion: conclusion }, props);
+    // A job cancelled while still queued never reached a runner (no
+    // runner_name) - its "duration" would be queue time, not run time.
+    const runMs = job.runner_name ? elapsedMs(job.started_at, job.completed_at) : undefined;
+    if (runMs !== undefined) putMetric('JobDuration', runMs, 'Milliseconds', dims, props);
+  }
+}
+
 exports.handler = async (event) => {
   // 1. Verify HMAC signature before touching anything else in the request.
   let secret;
@@ -40,7 +83,7 @@ exports.handler = async (event) => {
     secret = await getWebhookSecret();
   } catch (err) {
     console.error('Failed to load webhook secret:', err);
-    return reply(500, 'secret unavailable');
+    return replyError(500, 'secret unavailable');
   }
 
   const rawBody = event.body
@@ -53,6 +96,7 @@ exports.handler = async (event) => {
     received.length === expectedBuf.length && crypto.timingSafeEqual(received, expectedBuf);
   if (!signatureOk) {
     console.warn('Rejected webhook: invalid or missing signature');
+    putMetric('InvalidSignatures', 1, 'Count');
     return reply(401, 'invalid signature');
   }
 
@@ -69,44 +113,72 @@ exports.handler = async (event) => {
     parsed = parseWorkflowJobEvent(rawBody.toString('utf8'));
   } catch (err) {
     console.error('Failed to parse webhook body as JSON:', err);
-    return reply(400, 'invalid json');
+    return replyError(400, 'invalid json');
   }
-  const match = matchesRunnerRequest(parsed, REQUIRED_LABEL);
-  if (!match.matched) {
-    console.log(`Ignoring workflow_job event: ${match.reason}`);
+
+  const runId = parsed.workflow_job?.run_id;
+  const labels = parsed.workflow_job?.labels ?? [];
+
+  // 4. Is this job for us, and which runner profile (CPU architecture x
+  // flavor x size) does it get?
+  const route = resolveProfile(labels, LABEL_PREFIX, RUNNER_PROFILES);
+  if (!route.ours) {
+    console.log(`Ignoring workflow_job event: labels [${labels.join(', ')}] request no '${LABEL_PREFIX}-*' runner`);
     return reply(200, 'ignored');
   }
-  console.log(`Matched runner request: ${match.reason}`);
+  if (parsed.action !== 'queued') {
+    recordJobLifecycle(parsed, route);
+    return reply(200, 'recorded');
+  }
+  // A 422 shows up as a failed delivery in GitHub's webhook UI, next to the job.
+  if (!route.ok) {
+    console.warn(`[${runId}] Cannot route job: ${route.reason}`);
+    putMetric('UnroutableJobs', 1, 'Count', {}, { runId, repo: parsed.repository?.full_name, labels });
+    return reply(422, route.reason);
+  }
+  console.log(`[${runId}] ${route.reason}`);
 
-  // 4. Resolve the org/repo the JIT runner should register against.
+  // 5. Resolve the org/repo the JIT runner should register against.
   const target = resolveTarget(parsed, RUNNER_SCOPE);
   if (!target.ok) {
     console.error(`Cannot resolve JIT target for RUNNER_SCOPE=${RUNNER_SCOPE}: ${target.reason}`);
-    return reply(422, 'cannot resolve org/repo for configured RUNNER_SCOPE');
+    return replyError(422, 'cannot resolve org/repo for configured RUNNER_SCOPE');
   }
 
-  // 5. Enqueue the runner request for async processing by the worker Lambda.
-  const runId = parsed.workflow_job?.run_id;
-  const labels = parsed.workflow_job?.labels ?? [REQUIRED_LABEL];
-
+  // 6. Enqueue the runner request for async processing by the worker Lambda.
   if (!QUEUE_URL) {
     console.error('QUEUE_URL env var is not set');
-    return reply(500, 'queue not configured');
+    return replyError(500, 'queue not configured');
   }
 
-  const message = { scope: RUNNER_SCOPE, owner: target.owner, repo: target.repo, runId, labels };
+  const job = parsed.workflow_job ?? {};
+  const message = {
+    scope: RUNNER_SCOPE,
+    owner: target.owner,
+    repo: target.repo,
+    runId,
+    labels,
+    profile: route.profile,
+    // Context for logs and the worker's TimeToRunner metric only.
+    jobId: job.id,
+    jobName: job.name,
+    workflowName: job.workflow_name,
+    repoFullName: parsed.repository?.full_name,
+    createdAt: job.created_at,
+  };
   try {
     const result = await sqs.send(
       new SendMessageCommand({ QueueUrl: QUEUE_URL, MessageBody: JSON.stringify(message) })
     );
     console.log(
-      `[${runId}] Enqueued runner request (${RUNNER_SCOPE}) for '${target.owner}${
+      `[${runId}] Enqueued runner request (${RUNNER_SCOPE}, profile ${route.profile}) for '${target.owner}${
         RUNNER_SCOPE === 'repository' ? '/' + target.repo : ''
       }', labels: ${labels.join(', ')} - MessageId: ${result.MessageId}`
     );
+    putMetric('JobsQueued', 1, 'Count', { Profile: route.profile }, { runId, jobId: job.id, repo: message.repoFullName });
     return reply(202, 'queued');
   } catch (err) {
     console.error(`[${runId}] Failed to enqueue runner request:`, err);
-    return reply(500, 'enqueue failed');
+    return replyError(500, 'enqueue failed');
   }
 };
