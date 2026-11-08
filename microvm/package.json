@@ -3,6 +3,7 @@
   "private": true,
   "description": "Lifecycle hook server baked into the MicroVM image (app.js). Installed inside the Docker image with npm install --omit=dev, not in the Lambda deployment package.",
   "dependencies": {
+    "@aws-sdk/client-cloudwatch": "^3.1116.0",
     "@aws-sdk/client-lambda-microvms": "^3.1116.0"
   }
 }

@@ -1,0 +1,308 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  GitHub Ephemeral Runner Orchestrator - Phase C (observability).
+  Alarms (to an SNS topic, optionally emailed) and a CloudWatch dashboard
+  over the orchestrator's AWS metrics plus the custom metrics published
+  under MetricsNamespace by the orchestrator/worker Lambdas (Embedded Metric
+  Format) and by every MicroVM (microvm/app.js). Deploy AFTER
+  cloudformation/03-orchestrator.yaml. Every resource it watches is found by
+  the deterministic '<ProjectName>-...' names the other stacks use, and the
+  dashboard uses SEARCH expressions, so adding or removing runner profiles
+  needs no change here.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: github-runner-orchestrator
+    Description: Must match the ProjectName used for the other three stacks.
+
+  MetricsNamespace:
+    Type: String
+    Default: GitHubRunnerMicroVMs
+    Description: >
+      Must match the images and orchestrator stacks. Lambda metrics (which
+      the alarms use) are in this namespace; MicroVM resource metrics are in
+      '<MetricsNamespace>/Runner'.
+
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: >
+      Optional address subscribed to the alarm topic (AWS sends a
+      confirmation email first). Leave empty and subscribe something else
+      (Slack via AWS Chatbot, PagerDuty, ...) to the AlarmTopicArn output.
+
+  QueueTimeAlarmSeconds:
+    Type: Number
+    Default: 180
+    MinValue: 30
+    Description: >
+      Alarm when the p90 time a job waits between being queued and starting
+      on a runner (GitHub's own created_at -> started_at, so it includes VM
+      boot and runner registration) exceeds this over 15 minutes.
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+
+Resources:
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-alarms'
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Alarms. All treat missing data as OK: no traffic is not a fault.
+  # ══════════════════════════════════════════════════════════════════════
+
+  # A message only lands here after the worker failed it 3 times: a job
+  # that is (or was) waiting for a runner that will never come. Redrive
+  # from the SQS console once the cause is fixed.
+  DlqNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-dlq-not-empty'
+      AlarmDescription: Runner requests failed 3 times and were dead-lettered. Check the worker log group for "Worker failed at stage".
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !Sub '${ProjectName}-webhook-dlq'
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  # Requests are piling up faster than the worker launches runners
+  # (throttling, MicroVM capacity/quota, GitHub API trouble).
+  QueueBacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-queue-backlog'
+      AlarmDescription: The oldest runner request has waited over 5 minutes for the worker.
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value: !Sub '${ProjectName}-webhook-queue'
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 300
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  # Fleet-wide (dimensionless) series - fires for any profile. The
+  # dashboard breaks it down by Profile.
+  RunnerLaunchFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-runner-launch-failures'
+      AlarmDescription: >
+        The worker failed to launch runners (JIT config or RunMicrovm). Each
+        failure is retried up to 3 times, so a single blip can clear on its
+        own; 3+ in 5 minutes means something is actually broken. Logs
+        Insights on the worker log group: filter RunnerLaunchFailures > 0.
+      Namespace: !Ref MetricsNamespace
+      MetricName: RunnerLaunchFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  # A job used an mvm-* (or old lambda-microvms) label but not exactly one deployed profile label (typo,
+  # profile not enabled, or a pre-profiles workflow). It will sit queued in
+  # GitHub until it times out.
+  UnroutableJobsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-unroutable-jobs'
+      AlarmDescription: >
+        A job used an mvm-* (or old lambda-microvms) label but not exactly
+        one deployed mvm-<profile> label (plus optional self-hosted), so no
+        runner was launched. Logs Insights on
+        the orchestrator log group: filter UnroutableJobs > 0.
+      Namespace: !Ref MetricsNamespace
+      MetricName: UnroutableJobs
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  WebhookErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-webhook-errors'
+      AlarmDescription: The orchestrator could not accept GitHub webhooks (SSM, SQS or configuration failure) or threw.
+      Metrics:
+        - Id: handled
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Ref MetricsNamespace
+              MetricName: WebhookErrors
+            Period: 300
+            Stat: Sum
+        - Id: crashed
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub '${ProjectName}-orchestrator'
+            Period: 300
+            Stat: Sum
+        - Id: total
+          Expression: FILL(handled, 0) + FILL(crashed, 0)
+          Label: Webhook errors
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  SlowQueueTimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-slow-runner-start'
+      AlarmDescription: !Sub 'p90 job queue time (queued -> started on a runner) exceeded ${QueueTimeAlarmSeconds}s over 15 minutes.'
+      Namespace: !Ref MetricsNamespace
+      MetricName: JobQueueTime
+      ExtendedStatistic: p90
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: !Sub '${QueueTimeAlarmSeconds}000'
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Dashboard
+  # ══════════════════════════════════════════════════════════════════════
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}'
+      DashboardBody: !Sub |
+        {
+          "periodOverride": "auto",
+          "widgets": [
+            { "type": "text", "x": 0, "y": 0, "width": 24, "height": 2,
+              "properties": { "markdown": "## ${ProjectName} - ephemeral GitHub runners on Lambda MicroVMs\nPer-profile series come from SEARCH expressions, so new profiles appear automatically. **Sizing:** compare *Job peak memory / CPU* against each profile's baseline (small 2 GB / 1 vCPU, medium 4 GB / 2 vCPU, large 8 GB / 4 vCPU; each bursts to 4x)." } },
+
+            { "type": "metric", "x": 0, "y": 2, "width": 8, "height": 6,
+              "properties": { "title": "Jobs queued / runners launched / failures", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "view": "timeSeries",
+                "metrics": [
+                  [ "${MetricsNamespace}", "JobsQueued", { "label": "Jobs queued" } ],
+                  [ "${MetricsNamespace}", "RunnersLaunched", { "label": "Runners launched" } ],
+                  [ "${MetricsNamespace}", "RunnerLaunchFailures", { "label": "Launch failures", "color": "#d62728" } ],
+                  [ "${MetricsNamespace}", "UnroutableJobs", { "label": "Unroutable jobs", "color": "#ff7f0e" } ]
+                ] } },
+            { "type": "metric", "x": 8, "y": 2, "width": 8, "height": 6,
+              "properties": { "title": "Runners launched by profile", "region": "${AWS::Region}", "view": "timeSeries", "stacked": true,
+                "metrics": [ [ { "expression": "SEARCH('{${MetricsNamespace},Profile} MetricName=\"RunnersLaunched\"', 'Sum', 300)", "id": "launched" } ] ] } },
+            { "type": "metric", "x": 16, "y": 2, "width": 8, "height": 6,
+              "properties": { "title": "Job conclusions", "region": "${AWS::Region}", "view": "timeSeries", "stacked": true,
+                "metrics": [ [ { "expression": "SEARCH('{${MetricsNamespace},Conclusion} MetricName=\"JobsCompleted\"', 'Sum', 300)", "id": "concl" } ] ] } },
+
+            { "type": "metric", "x": 0, "y": 8, "width": 8, "height": 6,
+              "properties": { "title": "Job queue time p50 / p90 (queued -> started, s)", "region": "${AWS::Region}", "period": 300, "view": "timeSeries",
+                "metrics": [
+                  [ { "expression": "m1/1000", "label": "p50", "id": "e1" } ],
+                  [ { "expression": "m2/1000", "label": "p90", "id": "e2" } ],
+                  [ "${MetricsNamespace}", "JobQueueTime", { "stat": "p50", "id": "m1", "visible": false } ],
+                  [ "${MetricsNamespace}", "JobQueueTime", { "stat": "p90", "id": "m2", "visible": false } ]
+                ],
+                "annotations": { "horizontal": [ { "label": "alarm", "value": ${QueueTimeAlarmSeconds} } ] } } },
+            { "type": "metric", "x": 8, "y": 8, "width": 8, "height": 6,
+              "properties": { "title": "Webhook -> MicroVM launched p90 by profile (ms)", "region": "${AWS::Region}", "view": "timeSeries",
+                "metrics": [ [ { "expression": "SEARCH('{${MetricsNamespace},Profile} MetricName=\"TimeToRunner\"', 'p90', 300)", "id": "ttr" } ] ] } },
+            { "type": "metric", "x": 16, "y": 8, "width": 8, "height": 6,
+              "properties": { "title": "Job duration p90 by profile (ms)", "region": "${AWS::Region}", "view": "timeSeries",
+                "metrics": [ [ { "expression": "SEARCH('{${MetricsNamespace},Profile} MetricName=\"JobDuration\"', 'p90', 300)", "id": "dur" } ] ] } },
+
+            { "type": "metric", "x": 0, "y": 14, "width": 8, "height": 6,
+              "properties": { "title": "Job peak memory p90 by profile (MiB)", "region": "${AWS::Region}", "view": "timeSeries",
+                "metrics": [ [ { "expression": "SEARCH('{${MetricsNamespace}/Runner,Profile} MetricName=\"JobPeakMemoryMiB\"', 'p90', 3600)", "id": "pmem" } ] ] } },
+            { "type": "metric", "x": 8, "y": 14, "width": 8, "height": 6,
+              "properties": { "title": "Job peak CPU p90 by profile (vCPUs busy)", "region": "${AWS::Region}", "view": "timeSeries",
+                "metrics": [ [ { "expression": "SEARCH('{${MetricsNamespace}/Runner,Profile} MetricName=\"JobPeakCpuCores\"', 'p90', 3600)", "id": "pcpu" } ] ] } },
+            { "type": "metric", "x": 16, "y": 14, "width": 8, "height": 6,
+              "properties": { "title": "Job peak disk p90 by profile (MiB)", "region": "${AWS::Region}", "view": "timeSeries",
+                "metrics": [ [ { "expression": "SEARCH('{${MetricsNamespace}/Runner,Profile} MetricName=\"JobPeakDiskMiB\"', 'p90', 3600)", "id": "pdisk" } ] ] } },
+
+            { "type": "metric", "x": 0, "y": 20, "width": 8, "height": 6,
+              "properties": { "title": "Live memory used by profile (MiB, max)", "region": "${AWS::Region}", "view": "timeSeries",
+                "metrics": [ [ { "expression": "SEARCH('{${MetricsNamespace}/Runner,Profile} MetricName=\"MemoryUsedMiB\"', 'Maximum', 60)", "id": "mem" } ] ] } },
+            { "type": "metric", "x": 8, "y": 20, "width": 8, "height": 6,
+              "properties": { "title": "Live CPU used by profile (vCPUs busy, max)", "region": "${AWS::Region}", "view": "timeSeries",
+                "metrics": [ [ { "expression": "SEARCH('{${MetricsNamespace}/Runner,Profile} MetricName=\"CpuCoresUsed\"', 'Maximum', 60)", "id": "cpu" } ] ] } },
+            { "type": "metric", "x": 16, "y": 20, "width": 8, "height": 6,
+              "properties": { "title": "Queue depth / oldest request age / DLQ", "region": "${AWS::Region}", "period": 60, "view": "timeSeries",
+                "metrics": [
+                  [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${ProjectName}-webhook-queue", { "stat": "Maximum", "label": "Queue depth" } ],
+                  [ "AWS/SQS", "ApproximateAgeOfOldestMessage", "QueueName", "${ProjectName}-webhook-queue", { "stat": "Maximum", "label": "Oldest age (s)", "yAxis": "right" } ],
+                  [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${ProjectName}-webhook-dlq", { "stat": "Maximum", "label": "DLQ depth", "color": "#d62728" } ]
+                ] } },
+
+            { "type": "metric", "x": 0, "y": 26, "width": 12, "height": 6,
+              "properties": { "title": "Lambda invocations / errors / throttles", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "view": "timeSeries",
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-orchestrator", { "label": "orchestrator invocations" } ],
+                  [ "AWS/Lambda", "Errors", "FunctionName", "${ProjectName}-orchestrator", { "label": "orchestrator errors" } ],
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-worker", { "label": "worker invocations" } ],
+                  [ "AWS/Lambda", "Errors", "FunctionName", "${ProjectName}-worker", { "label": "worker errors" } ],
+                  [ "AWS/Lambda", "Throttles", "FunctionName", "${ProjectName}-worker", { "label": "worker throttles" } ],
+                  [ "${MetricsNamespace}", "InvalidSignatures", { "label": "invalid webhook signatures" } ]
+                ] } },
+            { "type": "metric", "x": 12, "y": 26, "width": 12, "height": 6,
+              "properties": { "title": "Lambda duration p90 (ms)", "region": "${AWS::Region}", "stat": "p90", "period": 300, "view": "timeSeries",
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${ProjectName}-orchestrator", { "label": "orchestrator" } ],
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${ProjectName}-worker", { "label": "worker" } ]
+                ] } },
+
+            { "type": "log", "x": 0, "y": 32, "width": 24, "height": 6,
+              "properties": { "title": "Recent launch failures (worker)", "region": "${AWS::Region}", "view": "table",
+                "query": "SOURCE '/aws/lambda/${ProjectName}-worker' | filter RunnerLaunchFailures > 0 | fields @timestamp, runId, repo, workflow, job, Profile, profile, stage, errorName, receiveCount | sort @timestamp desc | limit 50" } },
+            { "type": "log", "x": 0, "y": 38, "width": 24, "height": 6,
+              "properties": { "title": "Recent jobs: resource peaks per runner (MicroVMs)", "region": "${AWS::Region}", "view": "table",
+                "query": "SOURCE '/aws/lambda-microvms/${ProjectName}' | filter event = \"job_summary\" | fields @timestamp, profile, arch, runnerName, durationSeconds, peakCpuCores, peakMemoryMiB, peakDiskMiB, diskTotalMiB, exitCode, @logStream | sort @timestamp desc | limit 50" } },
+            { "type": "log", "x": 0, "y": 44, "width": 24, "height": 6,
+              "properties": { "title": "Unroutable jobs (orchestrator)", "region": "${AWS::Region}", "view": "table",
+                "query": "SOURCE '/aws/lambda/${ProjectName}-orchestrator' | filter UnroutableJobs > 0 | fields @timestamp, runId, repo, labels.0, labels.1, labels.2, labels.3 | sort @timestamp desc | limit 50" } }
+          ]
+        }
+
+Outputs:
+  AlarmTopicArn:
+    Description: Subscribe Slack/PagerDuty/etc. here for runner alarms
+    Value: !Ref AlarmTopic
+
+  DashboardUrl:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards/dashboard/${ProjectName}'

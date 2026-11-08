@@ -9,11 +9,13 @@ const {
   mintAppJwt,
   parseAppCredentials,
 } = require('./github');
-const { buildMicrovmConfig, selectImageIdentifier, runMicrovmWithRetry } = require('./microvms');
+const { buildMicrovmConfig, imageArnForProfile, runMicrovmWithRetry } = require('./microvms');
+const { putMetric } = require('./metrics');
 
 const APP_CREDENTIALS_PARAM = process.env.GITHUB_APP_CREDENTIALS_PARAM;
 const RUNNER_GROUP_ID = Number(process.env.RUNNER_GROUP_ID ?? '1');
 const DEFAULT_SCOPE = process.env.RUNNER_SCOPE ?? 'organization'; // fallback if a queued message predates a scope change
+const LABEL_PREFIX = process.env.RUNNER_LABEL_PREFIX || 'mvm';
 
 const ssm = new SSMClient({});
 
@@ -47,12 +49,19 @@ exports.handler = async (event) => {
     throw err;
   }
 
-  const { owner, repo, runId, labels } = message;
+  const { owner, repo, runId, labels, profile } = message;
   const scope = message.scope ?? DEFAULT_SCOPE;
+  const context = {
+    runId,
+    jobId: message.jobId,
+    repo: message.repoFullName,
+    workflow: message.workflowName,
+    job: message.jobName,
+  };
   console.log(
     `[${runId}] Worker received message ${messageId} - scope: ${scope}, target: ${owner}${
       scope === 'repository' ? '/' + repo : ''
-    }, labels: ${labels.join(', ')}`
+    }, profile: ${profile ?? '(none)'}, labels: ${labels.join(', ')}`
   );
 
   if (typeof microvmConfig === 'string') {
@@ -63,6 +72,23 @@ exports.handler = async (event) => {
   if (scope === 'repository' && !repo) {
     const err = new Error("RUNNER_SCOPE=repository but message has no 'repo' field");
     console.error(`[${runId}] ${err.message}`);
+    throw err;
+  }
+  // Every runner of a profile is registered with exactly these labels - never
+  // the job's own labels - so it can only ever take jobs that request this
+  // profile, and a job can never take a runner launched for another profile
+  // (see resolveProfile in lambda/orchestrator/filter.js).
+  const runnerLabels = ['self-hosted', `${LABEL_PREFIX}-${profile}`.toLowerCase()];
+
+  // Checked before minting a JIT config so a routing problem never leaves an
+  // orphaned runner registration behind in GitHub.
+  const imageIdentifier = imageArnForProfile(profile, microvmConfig);
+  if (!imageIdentifier) {
+    const err = new Error(
+      `No MicroVM image for profile '${profile ?? '(none)'}' - deployed profiles: ${microvmConfig.profiles.join(', ')}`
+    );
+    console.error(`[${runId}] ${err.message}`);
+    putMetric('RunnerLaunchFailures', 1, 'Count', {}, { ...context, profile, stage: 'resolveImage' });
     throw err;
   }
 
@@ -91,23 +117,40 @@ exports.handler = async (event) => {
     const runnerName = buildRunnerName(runId);
     const jit =
       scope === 'organization'
-        ? await generateOrgJitConfig(token, owner, { name: runnerName, runnerGroupId: RUNNER_GROUP_ID, labels })
-        : await generateRepoJitConfig(token, owner, repo, { name: runnerName, runnerGroupId: RUNNER_GROUP_ID, labels });
+        ? await generateOrgJitConfig(token, owner, { name: runnerName, runnerGroupId: RUNNER_GROUP_ID, labels: runnerLabels })
+        : await generateRepoJitConfig(token, owner, repo, { name: runnerName, runnerGroupId: RUNNER_GROUP_ID, labels: runnerLabels });
     console.log(`[${runId}] generateJitConfig (${scope}): ${Date.now() - t}ms - JIT runner created:`, JSON.stringify(jit.runner));
 
     stage = 'runMicrovmWithRetry';
     t = Date.now();
-    const imageIdentifier = selectImageIdentifier(labels, microvmConfig.images, microvmConfig.dockerLabel);
-    const hasDockerLabel = labels.includes(microvmConfig.dockerLabel);
-    console.log(`[${runId}] Launching ${hasDockerLabel ? 'docker' : 'no-docker'} image: ${imageIdentifier}`);
-    const launchConfig = { ...microvmConfig.base, imageIdentifier };
+    const logStream = `${profile}/${runnerName}`;
+    console.log(`[${runId}] Launching profile '${profile}' image: ${imageIdentifier}`);
+    const launchConfig = { ...microvmConfig.base, imageIdentifier, logStream };
     const vm = await runMicrovmWithRetry(launchConfig, jit.encoded_jit_config, { attempts: 3, delayMs: 5000 });
     console.log(
       `[${runId}] runMicrovmWithRetry: ${Date.now() - t}ms total - MicroVM launched: ${vm.microvmId}, endpoint: ${vm.endpoint}`
     );
+
+    // One line per launch tying the GitHub job to its MicroVM and log stream.
+    const launched = { ...context, profile, runnerName, microvmId: vm.microvmId, logGroup: microvmConfig.base.logGroup, logStream };
+    putMetric('RunnersLaunched', 1, 'Count', { Profile: profile }, launched);
+    putMetric('LaunchLatency', Date.now() - startedAt, 'Milliseconds', { Profile: profile }, { runId });
+    // Webhook created_at -> RunMicrovm returned: how long the job waited on us
+    // before its runner started booting (GitHub's JobQueueTime adds boot +
+    // registration on top).
+    const createdAtMs = Date.parse(message.createdAt ?? '');
+    if (!Number.isNaN(createdAtMs)) {
+      putMetric('TimeToRunner', Math.max(0, Date.now() - createdAtMs), 'Milliseconds', { Profile: profile }, { runId });
+    }
     console.log(`[${runId}] Worker completed message ${messageId} in ${Date.now() - startedAt}ms`);
   } catch (err) {
     console.error(`[${runId}] Worker failed at stage '${stage}' after ${Date.now() - startedAt}ms`, err);
+    putMetric('RunnerLaunchFailures', 1, 'Count', { Profile: profile }, {
+      ...context,
+      stage,
+      errorName: err?.name,
+      receiveCount: Number(record.attributes?.ApproximateReceiveCount ?? '1'),
+    });
     throw err;
   }
 };

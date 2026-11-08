@@ -8,22 +8,27 @@ const client = new LambdaMicrovmsClient({});
 const gzipAsync = promisify(zlib.gzip);
 
 /**
- * Pick the runner image by label: opt-in to the Docker-in-Docker image via
- * dockerLabel; everything else gets the plain (no-docker) image.
+ * Every runner profile's image is named '<ProjectName>-<profile>'
+ * (cloudformation/02-microvm-images.yaml), so its ARN is a fixed prefix plus
+ * the profile name the orchestrator resolved from the job's labels.
+ * @returns {string | undefined} undefined if this deployment has no such profile
  */
-function selectImageIdentifier(labels, images, dockerLabel) {
-  return labels.includes(dockerLabel) ? images.docker : images.noDocker;
+function imageArnForProfile(profile, config) {
+  return config.profiles.includes(profile) ? `${config.imageArnPrefix}${profile}` : undefined;
 }
 
 /** Build a MicrovmConfig from environment variables. Returns an error string if misconfigured. */
 function buildMicrovmConfig() {
-  const dockerImageIdentifier = process.env.MICROVM_IMAGE_IDENTIFIER_DOCKER;
-  const noDockerImageIdentifier = process.env.MICROVM_IMAGE_IDENTIFIER_NO_DOCKER;
+  const imageArnPrefix = process.env.MICROVM_IMAGE_ARN_PREFIX;
+  const profiles = (process.env.RUNNER_PROFILES ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
   const executionRoleArn = process.env.MICROVM_EXECUTION_ROLE_ARN;
   const ingressRaw = process.env.MICROVM_INGRESS_NETWORK_CONNECTORS;
   const egressRaw = process.env.MICROVM_EGRESS_NETWORK_CONNECTORS;
-  if (!dockerImageIdentifier) return 'MICROVM_IMAGE_IDENTIFIER_DOCKER env var is not set';
-  if (!noDockerImageIdentifier) return 'MICROVM_IMAGE_IDENTIFIER_NO_DOCKER env var is not set';
+  if (!imageArnPrefix) return 'MICROVM_IMAGE_ARN_PREFIX env var is not set';
+  if (profiles.length === 0) return 'RUNNER_PROFILES env var is not set';
   if (!executionRoleArn) return 'MICROVM_EXECUTION_ROLE_ARN env var is not set';
   if (!ingressRaw) return 'MICROVM_INGRESS_NETWORK_CONNECTORS env var is not set';
   if (!egressRaw) return 'MICROVM_EGRESS_NETWORK_CONNECTORS env var is not set';
@@ -35,9 +40,11 @@ function buildMicrovmConfig() {
       maxIdleDurationSeconds: Number(process.env.MICROVM_MAX_IDLE_SECONDS ?? '1800'),
       suspendedDurationSeconds: Number(process.env.MICROVM_SUSPENDED_SECONDS ?? '10'),
       maximumDurationInSeconds: Number(process.env.MICROVM_MAX_DURATION_SECONDS ?? '3600'),
+      // Optional: without it the MicroVM logs to the image's own Logging config.
+      logGroup: process.env.MICROVM_LOG_GROUP || undefined,
     },
-    images: { docker: dockerImageIdentifier, noDocker: noDockerImageIdentifier },
-    dockerLabel: process.env.DOCKER_RUNNER_LABEL ?? 'docker',
+    imageArnPrefix,
+    profiles,
   };
 }
 
@@ -68,6 +75,12 @@ async function runMicrovm(config, jitConfig) {
         suspendedDurationSeconds: config.suspendedDurationSeconds,
       },
       maximumDurationInSeconds: config.maximumDurationInSeconds,
+      // Name the stream after the runner (which embeds the workflow run id)
+      // instead of the default MicroVM id, so a job's VM log can be found
+      // from GitHub alone. Stream names may not contain ':' or '*'.
+      ...(config.logGroup
+        ? { logging: { cloudWatch: { logGroup: config.logGroup, logStream: config.logStream } } }
+        : {}),
       runHookPayload,
     })
   );
@@ -99,4 +112,4 @@ async function runMicrovmWithRetry(config, jitConfig, opts) {
   throw lastErr;
 }
 
-module.exports = { selectImageIdentifier, buildMicrovmConfig, runMicrovm, runMicrovmWithRetry };
+module.exports = { imageArnForProfile, buildMicrovmConfig, runMicrovm, runMicrovmWithRetry };

@@ -1,0 +1,4 @@
+schema_version: "1.1"
+name: adds-custom-profile-and-deploys
+expected_outcome: |
+  Adds x64-docker-xl to the Profiles mapping in cloudformation/02-microvm-images.yaml with Architecture X86_64 and MemoryMiB '8192', gives the 03-deploy-microvm-images.sh command with the full DOCKER_PROFILES list including the new profile, then 04-deploy-orchestrator.sh, and does not run deploy commands or change Lambda/IAM code.

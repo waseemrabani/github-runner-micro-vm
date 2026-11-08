@@ -1,0 +1,4 @@
+schema_version: "1.1"
+name: diagnoses-job-stuck-with-docker-label
+expected_outcome: |
+  Identifies that the upgrade replaced the docker label with profile labels, so the job has no profile label and the orchestrator rejects it as unroutable (422, UnroutableJobs alarm); fixes runs-on to a single Docker profile label such as [self-hosted, mvm-arm64-docker-medium]; explains where to confirm it (orchestrator log 'Cannot route job' or the App's webhook deliveries).

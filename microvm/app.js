@@ -6,10 +6,13 @@
 // poking the image manually while iterating on it).
 'use strict';
 
+const fs = require('fs');
 const http = require('http');
+const os = require('os');
 const { spawn, execFile } = require('child_process');
 const zlib = require('zlib');
 const { LambdaMicrovmsClient, TerminateMicrovmCommand } = require('@aws-sdk/client-lambda-microvms');
+const { CloudWatchClient, PutMetricDataCommand } = require('@aws-sdk/client-cloudwatch');
 
 // Stored after the /run hook fires - used only for logging.
 let runnerName = null;
@@ -99,6 +102,140 @@ function startDnsmasq() {
     console.error(`dnsmasq exited - code: ${code ?? '(null)'}, signal: ${signal ?? '(null)'}`)
   );
   console.log('dnsmasq forwarder started (172.17.0.1 -> 127.0.0.2 via /etc/resolv.conf)');
+}
+
+// ── Resource usage sampling ───────────────────────────────────────────────
+// Lambda MicroVMs publishes no CPU/memory metrics of its own, and a
+// profile's size is fixed per image - so to tell whether jobs need a bigger
+// (or smaller) profile, sample usage here while the job runs and publish it
+// per profile. RUNNER_PROFILE and RUNNER_METRICS_NAMESPACE come from the
+// image's EnvironmentVariables (cloudformation/02-microvm-images.yaml).
+// Sampling starts at /run, not at boot, so the snapshot build is never
+// measured. Nothing here is allowed to affect the job: every failure is
+// logged and swallowed.
+const PROFILE = process.env.RUNNER_PROFILE || 'unknown';
+const METRICS_NAMESPACE = process.env.RUNNER_METRICS_NAMESPACE;
+const SAMPLE_INTERVAL_MS = 5_000;
+const PUBLISH_INTERVAL_MS = 60_000;
+const FINAL_PUBLISH_TIMEOUT_MS = 5_000;
+const MIB = 1024 * 1024;
+
+let cloudWatch;
+function getCloudWatch() {
+  const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION;
+  return (cloudWatch ??= new CloudWatchClient(region ? { region } : {}));
+}
+
+// Aggregate jiffies across every vCPU the guest sees (first line of
+// /proc/stat: user nice system idle iowait irq softirq steal ...).
+function readCpuTimes() {
+  const fields = fs.readFileSync('/proc/stat', 'utf8').split('\n', 1)[0].trim().split(/\s+/).slice(1).map(Number);
+  return { idle: fields[3] + (fields[4] || 0), total: fields.slice(0, 8).reduce((a, b) => a + (b || 0), 0) };
+}
+
+function readMemoryMiB() {
+  const info = fs.readFileSync('/proc/meminfo', 'utf8');
+  const kib = (key) => Number(new RegExp(`^${key}:\\s+(\\d+)`, 'm').exec(info)?.[1]);
+  return { used: (kib('MemTotal') - kib('MemAvailable')) / 1024, total: kib('MemTotal') / 1024 };
+}
+
+// Docker image layers and build cache live under /var/lib/docker on the same
+// root filesystem, so this is what fills up on undersized Docker profiles.
+function readDiskMiB() {
+  const s = fs.statfsSync('/');
+  return { used: ((s.blocks - s.bfree) * s.bsize) / MIB, total: (s.blocks * s.bsize) / MIB };
+}
+
+const round = (n) => Math.round(n * 100) / 100;
+
+async function putMetrics(metrics) {
+  if (!METRICS_NAMESPACE) return;
+  const dims = [{ Name: 'Profile', Value: PROFILE }];
+  const now = new Date();
+  const data = metrics
+    .filter((m) => m.values.length > 0)
+    .map((m) => ({ MetricName: m.name, Unit: m.unit, Dimensions: dims, Timestamp: now, Values: m.values.map(round) }));
+  if (data.length === 0) return;
+  await getCloudWatch().send(new PutMetricDataCommand({ Namespace: METRICS_NAMESPACE, MetricData: data }));
+}
+
+/**
+ * Samples every SAMPLE_INTERVAL_MS and publishes the raw samples once a
+ * minute (PutMetricData's Values[] keeps them as a distribution, so Maximum
+ * and percentiles stay exact), then a per-job peak of each on stop().
+ */
+function startResourceSampler() {
+  const cpuCount = os.cpus().length;
+  const pending = { cpu: [], mem: [], disk: [] };
+  const peak = { cpu: 0, mem: 0, disk: 0 };
+  let totals = { mem: 0, disk: 0 };
+  let prevCpu;
+  let warned = false;
+
+  const warnOnce = (what, err) => {
+    if (warned) return;
+    warned = true;
+    console.warn(`Resource sampler: ${what} failed (further errors suppressed):`, err && err.message ? err.message : err);
+  };
+
+  const sample = () => {
+    try {
+      const cpu = readCpuTimes();
+      if (prevCpu && cpu.total > prevCpu.total) {
+        const busy = 1 - (cpu.idle - prevCpu.idle) / (cpu.total - prevCpu.total);
+        const cores = Math.max(0, busy * cpuCount);
+        pending.cpu.push(cores);
+        peak.cpu = Math.max(peak.cpu, cores);
+      }
+      prevCpu = cpu;
+      const mem = readMemoryMiB();
+      const disk = readDiskMiB();
+      pending.mem.push(mem.used);
+      pending.disk.push(disk.used);
+      peak.mem = Math.max(peak.mem, mem.used);
+      peak.disk = Math.max(peak.disk, disk.used);
+      totals = { mem: mem.total, disk: disk.total };
+    } catch (err) {
+      warnOnce('sampling', err);
+    }
+  };
+
+  const publish = () =>
+    putMetrics([
+      { name: 'CpuCoresUsed', unit: 'None', values: pending.cpu.splice(0) },
+      { name: 'MemoryUsedMiB', unit: 'Megabytes', values: pending.mem.splice(0) },
+      { name: 'DiskUsedMiB', unit: 'Megabytes', values: pending.disk.splice(0) },
+    ]).catch((err) => warnOnce('PutMetricData', err));
+
+  sample();
+  const sampleTimer = setInterval(sample, SAMPLE_INTERVAL_MS);
+  const publishTimer = setInterval(publish, PUBLISH_INTERVAL_MS);
+
+  return {
+    /** Stop sampling, flush, and return the job's peaks. Never throws. */
+    async stop() {
+      clearInterval(sampleTimer);
+      clearInterval(publishTimer);
+      sample();
+      const flush = Promise.all([
+        publish(),
+        putMetrics([
+          { name: 'JobPeakCpuCores', unit: 'None', values: [peak.cpu] },
+          { name: 'JobPeakMemoryMiB', unit: 'Megabytes', values: [peak.mem] },
+          { name: 'JobPeakDiskMiB', unit: 'Megabytes', values: [peak.disk] },
+        ]).catch((err) => warnOnce('PutMetricData', err)),
+      ]);
+      await Promise.race([flush, new Promise((resolve) => setTimeout(resolve, FINAL_PUBLISH_TIMEOUT_MS))]);
+      return {
+        vcpusVisible: cpuCount,
+        memoryTotalMiB: Math.round(totals.mem),
+        diskTotalMiB: Math.round(totals.disk),
+        peakCpuCores: round(peak.cpu),
+        peakMemoryMiB: Math.round(peak.mem),
+        peakDiskMiB: Math.round(peak.disk),
+      };
+    },
+  };
 }
 
 function readBody(req) {
@@ -191,10 +328,28 @@ async function handleRequest(req, res) {
         stdio: 'inherit',
         env: { ...process.env, ENCODED_JIT_CONFIG: encodedJitConfig },
       });
+      const jobStartedAt = Date.now();
+      const sampler = startResourceSampler();
 
-      child.on('exit', (code, signal) => {
+      child.on('exit', async (code, signal) => {
         console.log(`Runner process exited - code: ${code ?? '(null)'}, signal: ${signal ?? '(null)'}`);
-        terminateSelf(microvmId);
+        const usage = await sampler.stop();
+        // One JSON line per job - query across the fleet with Logs Insights,
+        // e.g. `filter event = "job_summary" | stats max(peakMemoryMiB) by profile`.
+        console.log(
+          JSON.stringify({
+            event: 'job_summary',
+            profile: PROFILE,
+            runnerName,
+            microvmId,
+            arch: os.arch(),
+            exitCode: code,
+            signal,
+            durationSeconds: Math.round((Date.now() - jobStartedAt) / 1000),
+            ...usage,
+          })
+        );
+        await terminateSelf(microvmId);
       });
 
       res.writeHead(200);
